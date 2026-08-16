@@ -1,0 +1,6 @@
+{
+  "name": "watchcat-gateway",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": { "start": "node server.js", "test": "node --check server.js" }
+}
