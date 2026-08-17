@@ -48,6 +48,7 @@ bool mdnsStarted = false;
 IPAddress sensorIp;
 uint32_t sensorIpAt = 0;
 constexpr uint32_t kSensorIpTtlMs = 60000;
+uint32_t liveFrames = 0, liveFetchMs = 0, liveDrawMs = 0, liveStatAt = 0;
 bool detail = false, liveView = false;
 // The waiting state is drawn from a Hangul bitmap, so it is matched by this marker
 // rather than printed as text. Every other title is ASCII and prints normally.
@@ -147,8 +148,9 @@ void showLiveFrame() {
   if (!wifi()) return;
   const String base = sensorBase();
   if (!base.length()) return;
+  const uint32_t fetchStart = millis();
   HTTPClient http; WiFiClientSecure secureClient;
-  const String endpoint = base + "/api/v1/live.jpg?t=" + String(millis());
+  const String endpoint = base + "/api/v1/live.jpg";
   if (!beginGateway(http, secureClient, endpoint)) return;
   if (strlen(WATCHCAT_CAMERA_TOKEN)) http.addHeader("Authorization", String("Bearer ") + WATCHCAT_CAMERA_TOKEN);
   const int code = http.GET();
@@ -159,16 +161,31 @@ void showLiveFrame() {
   WiFiClient* stream = http.getStreamPtr();
   const size_t read = stream->readBytes(jpeg, size);
   http.end();
+  liveFetchMs += millis() - fetchStart;
   // Only decode something that is actually a JPEG. Anything else on this endpoint —
   // a captive portal, an ISP error page — used to be pushed straight to the decoder
   // and painted as garbage.
   const bool isJpeg = size >= 4 && jpeg[0] == 0xFF && jpeg[1] == 0xD8 && jpeg[2] == 0xFF;
   if (read == static_cast<size_t>(size) && isJpeg) {
-    tft.fillScreen(ST77XX_BLACK);
+    const uint32_t drawStart = millis();
+    // No clear between frames. The frame covers every visible pixel, so clearing first
+    // only pushed another 134 KB over SPI — roughly doubling the per-frame draw cost —
+    // and the black flash it left behind is what made the stream look like it was
+    // repainting rather than moving.
     TJpgDec.drawJpg(-20, 0, jpeg, size);
     tft.setTextColor(ST77XX_CYAN); tft.setTextSize(1); tft.setCursor(8, 8); tft.print("LIVE  B3 STOP");
+    liveDrawMs += millis() - drawStart;
+    liveFrames++;
   }
   free(jpeg);
+  if (millis() - liveStatAt >= 2000) {
+    if (liveFrames) Serial.printf("Live: %.1f fps  fetch %lums  draw %lums (avg over %lu frames)\n",
+                                  liveFrames * 1000.0 / (millis() - liveStatAt),
+                                  static_cast<unsigned long>(liveFetchMs / liveFrames),
+                                  static_cast<unsigned long>(liveDrawMs / liveFrames),
+                                  static_cast<unsigned long>(liveFrames));
+    liveStatAt = millis(); liveFrames = 0; liveFetchMs = 0; liveDrawMs = 0;
+  }
 }
 // Runs independently of loop(), so a tap during a blocking request is still seen.
 void buttonTask(void*) {
@@ -202,6 +219,10 @@ void setup() {
   xTaskCreate(buttonTask, "buttons", 2048, nullptr, 2, nullptr);
   tftSpi.begin(13, -1, 14, 11);
   tft.init(240, 280); tft.setRotation(2);
+  // The library defaults to 32 MHz. Every live frame pushes 134 KB of pixels, so the
+  // clock is the floor on frame time. 40 MHz is a modest step that stays well inside
+  // what this panel and these breadboard jumpers carry reliably.
+  tft.setSPISpeed(40000000);
   // No pre-swap: the decoder hands drawRGBBitmap() native uint16_t RGB565 and
   // Adafruit_SPITFT byte-swaps on its way to the panel. Pre-swapping here made that a
   // double swap, which decoded the geometry correctly but painted it in neon colors.

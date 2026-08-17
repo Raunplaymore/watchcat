@@ -27,7 +27,7 @@ camera_config_t kCamera = {
   .pin_d1=17, .pin_d0=15, .pin_vsync=38, .pin_href=47, .pin_pclk=13,
   .xclk_freq_hz=20000000, .ledc_timer=LEDC_TIMER_0, .ledc_channel=LEDC_CHANNEL_0,
   .pixel_format=PIXFORMAT_JPEG, .frame_size=FRAMESIZE_UXGA, .jpeg_quality=4,
-  .fb_count=1, .fb_location=CAMERA_FB_IN_PSRAM, .grab_mode=CAMERA_GRAB_LATEST,
+  .fb_count=2, .fb_location=CAMERA_FB_IN_PSRAM, .grab_mode=CAMERA_GRAB_LATEST,
 };
 WebServer server(80);
 bool cameraReady = false;
@@ -112,10 +112,10 @@ void tuneSensor(sensor_t* sensor) {
   tune("sharpness", sensor->set_sharpness(sensor, 2));
   tune("denoise", sensor->set_denoise(sensor, 4));
 }
-// The sensor keeps emitting the previous geometry for a frame after a framesize
-// change, and with fb_count=1 the next fb_get hands that stale buffer straight to
-// the caller. Drain until the geometry settles: the monitor silently drops frames
-// over 120 KB, and a still queued for inference must not arrive at QVGA.
+// The sensor keeps emitting the previous geometry for a frame or two after a framesize
+// change, and those already-queued buffers are handed to the next fb_get. Drain until
+// the geometry settles: the monitor silently drops frames over 120 KB, and a still
+// queued for inference must not arrive at QVGA.
 void setFrameSize(framesize_t size) {
   sensor_t* sensor = esp_camera_sensor_get();
   if (!sensor) { lastError = "Camera sensor unavailable"; return; }
