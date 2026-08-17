@@ -31,9 +31,14 @@ namespace {
 SPIClass tftSpi(HSPI);
 Adafruit_ST7789 tft(&tftSpi, 11, 10, 9);
 constexpr int kButtons[] = {5, 6, 7};
-constexpr uint32_t kDebounceMs = 40, kPollMs = 2000, kLivePollMs = 900;
-bool lastRead[] = {HIGH, HIGH, HIGH}, stable[] = {HIGH, HIGH, HIGH};
-uint32_t changed[] = {0, 0, 0}, lastPoll = 0, lastAutoCapture = 0;
+constexpr uint32_t kDebounceMs = 40, kPollMs = 2000, kLivePollMs = 900, kButtonSampleMs = 10;
+uint32_t lastPoll = 0;
+// Presses are latched by a sampling task, not read from loop(). A status poll is a
+// blocking TLS request that can hold loop() for seconds, and the poll timer fires
+// again the moment it returns, so loop() sampled the pins roughly once per poll.
+// Debounce needs two samples of a held button, which meant only a multi-second hold
+// ever registered and an ordinary tap was dropped between polls.
+volatile bool pressLatched[] = {false, false, false};
 bool detail = false, liveView = false;
 String title = "INFERENCE WAITING", message = "Booting";
 
@@ -113,12 +118,28 @@ void showLiveFrame() {
   }
   free(jpeg);
 }
+// Runs independently of loop(), so a tap during a blocking request is still seen.
+void buttonTask(void*) {
+  bool lastRead[] = {HIGH, HIGH, HIGH}, stable[] = {HIGH, HIGH, HIGH};
+  uint32_t changed[] = {0, 0, 0};
+  for (;;) {
+    for (int i = 0; i < 3; i++) {
+      const bool raw = digitalRead(kButtons[i]);
+      if (raw != lastRead[i]) { changed[i] = millis(); lastRead[i] = raw; }
+      if (millis() - changed[i] < kDebounceMs || raw == stable[i]) continue;
+      stable[i] = raw;
+      if (raw == LOW) {
+        pressLatched[i] = true;
+        Serial.printf("Button B%d pressed (GPIO%d)\n", i + 1, kButtons[i]);
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(kButtonSampleMs));
+  }
+}
 bool pressed(int index) {
-  const bool raw = digitalRead(kButtons[index]); if (raw != lastRead[index]) changed[index] = millis(); lastRead[index] = raw;
-  if (millis() - changed[index] < kDebounceMs || raw == stable[index]) return false;
-  stable[index] = raw;
-  if (raw == LOW) Serial.printf("Button B%d pressed (GPIO%d)\n", index + 1, kButtons[index]);
-  return raw == LOW;
+  if (!pressLatched[index]) return false;
+  pressLatched[index] = false;
+  return true;
 }
 }
 
@@ -126,6 +147,7 @@ void setup() {
   Serial.begin(115200); delay(200);
   for (int pin : kButtons) pinMode(pin, INPUT_PULLUP);
   Serial.printf("Buttons ready: B1=%d B2=%d B3=%d\n", kButtons[0], kButtons[1], kButtons[2]);
+  xTaskCreate(buttonTask, "buttons", 2048, nullptr, 2, nullptr);
   tftSpi.begin(13, -1, 14, 11);
   tft.init(240, 280); tft.setRotation(2);
   TJpgDec.setJpgScale(1); TJpgDec.setSwapBytes(true); TJpgDec.setCallback(tftOutput);
