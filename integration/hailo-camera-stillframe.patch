@@ -1,0 +1,69 @@
+단일 정지 이미지 추론이 탐지를 0개 반환하는 문제 수정.
+
+적용 대상: /home/ray/hailo-camera/current/server.js (Pi)
+
+증상
+  watchcat이 올린 JPEG 한 장은 항상 detections 0개를 반환한다.
+  raw 메타(`/tmp/<jobId>.meta.json.raw`)가 `[]`로 기록된다.
+
+원인
+  normalizeService7FileInput()이 jpg 입력을 ffmpeg에 `-loop` 없이 넘기므로
+  1프레임 mkv가 만들어진다. hailonet은 네트워크 구성 중 앞쪽 버퍼를 소비하기
+  때문에, 프레임이 하나뿐이면 hailofilter까지 도달하는 버퍼가 남지 않는다.
+
+근거 (같은 HEF, 같은 후처리 라이브러리·함수로 측정)
+  고양이 사진 (JPEG)                  -> raw []            0 프레임
+  사람이 있는 골프 프레임 (JPEG)       -> raw []            0 프레임
+  골프 영상 2초 (mp4)                 -> raw 7,911 B      22 프레임
+  같은 고양이 사진을 1초 클립으로 변환 -> raw 7,453 B       9 프레임
+  => 이미지 내용과 무관하며, 입력이 단일 프레임일 때만 실패한다.
+
+골프 파이프라인 영향 없음
+  - 변경은 `stillImage`(= format === 'jpg')가 true인 경로 안에만 존재한다.
+  - 로그 전수 확인: from-file의 jpg 입력 호출 193건은 모두 watchcat 잡이고,
+    골프 잡이 jpg 분기를 사용한 이력은 0건이다.
+  - 세션/라이브/MJPEG 프리뷰 경로와 전역 AI_POSTPROCESS_CONFIG는 건드리지 않는다.
+  - mp4/h264 입력의 ffmpeg 인자는 바이트 단위로 동일하다.
+
+--- a/server.js
++++ b/server.js
+@@ (runHailoInferenceOnFile 내부, normalizeService7FileInput 호출)
+         timeoutMs: Math.max(SERVICE7_NORMALIZE_TIMEOUT_MS, computeAnalyzeTimeout(format, durationSec)),
++        stillImage: format === 'jpg',
+       });
+
+@@ (함수 시그니처)
+-async function normalizeService7FileInput({ inputPath, targetWidth, targetHeight, timeoutMs }) {
++async function normalizeService7FileInput({ inputPath, targetWidth, targetHeight, timeoutMs, stillImage = false }) {
+
+@@ (ffmpeg 인자 구성)
++  // hailonet returns nothing for a single-frame input: the first buffers are consumed
++  // while the network is configured, so a one-frame still yields an empty detection
++  // set. Stills are therefore repeated into a short clip. Video inputs are untouched.
++  const stillFrames = 8;
+   const args = [
+     '-hide_banner',
+     '-nostdin',
+     '-y',
+     '-noautorotate',
++    ...(stillImage ? ['-loop', '1'] : []),
+     '-i', inputPath,
+     '-map', '0:v:0',
+     '-an',
++    ...(stillImage ? ['-frames:v', String(stillFrames), '-r', '10'] : []),
+     '-vf', filters.join(','),
+     '-c:v', 'ffv1',
+
+적용 절차
+  1. cp -p server.js server.js.bak-before-stillfix
+  2. 위 3개 지점 수정
+  3. node --check server.js
+  4. pm2 restart hailo-camera
+  5. 회귀 확인 — 골프 mp4로 from-file 실행, 22프레임 수준이 유지되는지 확인
+  6. 검증 — watchcat JPEG로 from-file 실행, raw가 [] 이 아닌지 확인
+  되돌리기: 백업 복원 후 pm2 restart hailo-camera
+
+주의
+  현재 코드는 /home/ray/hailo-camera/releases/20260817011719/ 에 있고
+  hailo-camera-repo/server.js(6월 30일자)와 다르다. 다음 배포가 이 수정을
+  덮어쓰지 않도록 실제 배포 원본에도 같은 변경을 넣어야 한다.
