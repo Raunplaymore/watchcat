@@ -2,25 +2,32 @@
 
 ## 목표
 
-`watchcat`은 음성 명령을 받으면 XIAO ESP32S3 Sense 카메라가 사진을 촬영하고, Raspberry Pi 5의 Hailo가 사진에 고양이가 있는지를 판정하는 시스템이다. 결과와 최근 사진은 Raspberry Pi의 웹 서버에서 확인한다.
+`watchcat`은 음성 명령을 받으면 캣센서가 사진을 촬영하고, Raspberry Pi 5의 Hailo가 사진에 고양이가 있는지를 판정하는 시스템이다. 결과와 최근 사진은 Raspberry Pi의 웹 서버에서 확인한다.
+
+## 장치 명칭
+
+| 명칭 | 실제 장치 |
+|---|---|
+| 캣센서 | XIAO ESP32S3 Sense + OV3660 카메라 |
+| 캣모니터 | ESP32-S3 WROOM-1 + TFT + 3개 버튼 |
 
 ## 장치 역할
 
 | 장치 | 역할 | 장기 운영 필수 여부 |
 |---|---|---|
-| XIAO ESP32S3 Sense | OV3660 촬영, JPEG를 Pi로 전송 | 필수 |
+| 캣센서 | OV3660 촬영, JPEG를 Pi로 전송 | 필수 |
 | Raspberry Pi 5 + Hailo | 음성 명령 처리, 사진 수신, Hailo 추론, 웹 UI와 결과 보관 | 필수 |
 | ReSpeaker | `고양이 어디있나` 음성 명령을 Pi에 전달 | 필수 |
-| 메인 ESP32-S3 + TFT + 버튼 | 개발 중 상태·결과를 물리 화면에서 확인 | 개발 단계용 |
+| 캣모니터 | 개발 중 상태·결과를 물리 화면에서 확인 | 개발 단계용 |
 
-메인 ESP32-S3 개발보드는 현재 검증된 TFT 배선을 유지하기 위해 사용한다. XIAO의 카메라 확장 보드는 TFT의 현재 GPIO 10, 11, 15, 16과 충돌하므로, 최종 운영에서 XIAO에 TFT를 병합하지 않는다.
+캣모니터는 현재 검증된 TFT 배선을 유지하기 위해 사용한다. 캣센서의 카메라 확장 보드는 TFT의 현재 GPIO 10, 11, 15, 16과 충돌하므로, 최종 운영에서 두 장치를 병합하지 않는다.
 
 ## 최종 데이터 흐름
 
 ```text
 ReSpeaker
   → Raspberry Pi 음성 명령 서비스
-  → XIAO 카메라에 촬영 요청
+  → 캣센서에 촬영 요청
   → JPEG 업로드
   → Pi의 watchcat 게이트웨이
   → hailo-camera 파일 추론
@@ -28,7 +35,7 @@ ReSpeaker
   → Pi 웹 UI 및 개발용 TFT 상태 표시
 ```
 
-XIAO와 Pi는 같은 Wi-Fi에서 통신한다. Pi가 최종 상태의 기준점이며, XIAO는 고양이 판정이나 웹 화면을 직접 담당하지 않는다.
+캣센서와 Pi는 같은 Wi-Fi에서 통신한다. Pi가 최종 상태의 기준점이며, 캣센서는 고양이 판정이나 웹 화면을 직접 담당하지 않는다.
 
 ## 기존 hailo-camera 보호 원칙
 
@@ -42,9 +49,9 @@ XIAO와 Pi는 같은 Wi-Fi에서 통신한다. Pi가 최종 상태의 기준점�
 
 ## API 계약 초안
 
-### XIAO 카메라 API
+### 캣센서 API
 
-Pi가 XIAO에 호출한다.
+캣센서는 도메인 게이트웨이에 명령을 폴링하고, 받은 촬영 명령을 처리한다.
 
 - `POST /api/v1/capture`
   - JPEG 한 장을 촬영하고 Pi watchcat 게이트웨이로 업로드한다.
@@ -54,7 +61,7 @@ Pi가 XIAO에 호출한다.
 
 ### Pi watchcat 게이트웨이 API
 
-XIAO와 TFT/웹 UI가 호출한다.
+캣센서와 캣모니터/TFT/웹 UI가 호출한다.
 
 - `POST /api/v1/frames`
   - `Content-Type: image/jpeg`의 사진을 수신한다.
@@ -65,7 +72,10 @@ XIAO와 TFT/웹 UI가 호출한다.
 - `GET /api/v1/latest.jpg`
   - 최근 사진을 반환한다.
 - `POST /api/v1/capture`
-  - 개발용 TFT 또는 Pi 웹 UI의 요청을 XIAO 카메라의 촬영 API로 전달한다.
+  - 캣모니터 또는 Pi 웹 UI의 요청을 대기 촬영 명령으로 저장한다.
+- `GET /api/v1/commands/next`
+  - 캣센서가 Bearer 토큰으로 폴링한다. 대기 명령이 있으면 `capture`와 요청 ID를 반환한다.
+  - 캣센서는 JPEG 업로드에 요청 ID를 포함하고, 게이트웨이는 수신 성공 시 명령을 완료한다.
 
 Wi-Fi SSID, 비밀번호, Pi 주소, API 토큰은 코드에 넣지 않고 각 장치의 로컬 설정 파일/환경변수로 관리한다.
 
@@ -83,10 +93,10 @@ Wi-Fi SSID, 비밀번호, Pi 주소, API 토큰은 코드에 넣지 않고 각 �
 
 ### Phase 1 — 사진 한 장의 전체 경로
 
-목표: XIAO 사진 한 장을 Hailo가 판정한다.
+목표: 캣센서 사진 한 장을 Hailo가 판정한다.
 
-- XIAO가 OV3660에서 JPEG를 촬영한다.
-- XIAO가 Pi 게이트웨이에 사진을 업로드한다.
+- 캣센서가 OV3660에서 JPEG를 촬영한다.
+- 캣센서가 Pi 게이트웨이에 사진을 업로드한다.
 - 게이트웨이가 사진을 별도 경로에 저장하고 Hailo 파일 추론을 요청한다.
 - 고양이 유무·신뢰도·시각이 상태 API와 웹 UI에 표시된다.
 
@@ -96,7 +106,7 @@ Wi-Fi SSID, 비밀번호, Pi 주소, API 토큰은 코드에 넣지 않고 각 �
 
 목표: 물리 장치에서 Phase 1 결과를 확인하고 촬영을 시작한다.
 
-- 메인 ESP32-S3가 TFT, 3개 버튼, debounce를 초기화한다.
+- 캣모니터가 TFT, 3개 버튼, debounce를 초기화한다.
 - TFT는 `CAT FOUND`, `NO CAT`, `CAMERA OFFLINE`, `INFERENCE WAITING`, `ERROR`를 표시한다.
 - 버튼 1은 즉시 촬영 요청, 버튼 2는 상태/최근 결과 화면 전환, 버튼 3은 자동 촬영 시작·정지에 사용한다.
 - TFT 핀은 GPIO 15/16/9/10/11, 버튼은 GPIO 5/6/7, `tft.init(240, 280)`, `tft.setRotation(2)`를 유지한다.
@@ -118,7 +128,7 @@ Wi-Fi SSID, 비밀번호, Pi 주소, API 토큰은 코드에 넣지 않고 각 �
 
 목표: 장기 설치 환경에서 복구 가능하게 동작한다.
 
-- XIAO와 Pi의 Wi-Fi 재연결
+- 캣센서와 Pi의 Wi-Fi 재연결
 - Hailo 대기열 제한과 타임아웃
 - 최근 사진 보관 수·디스크 정리
 - 전원 재시작 후 자동 복구
