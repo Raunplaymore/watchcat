@@ -76,11 +76,25 @@ bool wifi(uint32_t timeout = 15000) {
 bool authorized() {
   return !strlen(WATCHCAT_CAMERA_TOKEN) || server.header("Authorization") == String("Bearer ") + WATCHCAT_CAMERA_TOKEN;
 }
-void applyFrameSize() {
+// The sensor keeps emitting the previous geometry for a frame after a framesize
+// change, and with fb_count=1 the next fb_get hands that stale buffer straight to
+// the caller. Drain until the geometry settles: the monitor silently drops frames
+// over 120 KB, and a still queued for inference must not arrive at QVGA.
+void setFrameSize(framesize_t size) {
   sensor_t* sensor = esp_camera_sensor_get();
   if (!sensor) { lastError = "Camera sensor unavailable"; return; }
-  sensor->set_framesize(sensor, (remoteStreaming || directLive) ? FRAMESIZE_QVGA : FRAMESIZE_UXGA);
+  if (sensor->set_framesize(sensor, size) != 0) { lastError = "Frame size change failed"; return; }
+  const uint16_t expected = resolution[size].width;
+  for (int attempt = 0; attempt < 4; attempt++) {
+    camera_fb_t* frame = esp_camera_fb_get();
+    if (!frame) return;
+    const bool settled = frame->width == expected;
+    esp_camera_fb_return(frame);
+    if (settled) return;
+  }
+  lastError = "Frame size did not settle";
 }
+void applyFrameSize() { setFrameSize((remoteStreaming || directLive) ? FRAMESIZE_QVGA : FRAMESIZE_UXGA); }
 void ensureMdns() {
   if (mdnsStarted || WiFi.status() != WL_CONNECTED) return;
   mdnsStarted = MDNS.begin("watchcat-sensor");
@@ -117,6 +131,16 @@ bool upload(const String& commandId = "", bool isStreaming = false) {
   esp_camera_fb_return(frame); http.end();
   if (code < 200 || code >= 300) { lastError = "Upload HTTP " + String(code); return false; }
   lastCaptureAt = String(millis()); lastError = ""; return true;
+}
+// A still headed for inference is always full resolution, even mid-live-view:
+// live view runs the sensor at QVGA, and uploading that would hand Hailo a
+// 320x240 frame to find a cat in. Restores the live geometry afterwards.
+bool captureStill(const String& commandId = "") {
+  const bool resumeStreaming = remoteStreaming || directLive;
+  if (resumeStreaming) setFrameSize(FRAMESIZE_UXGA);
+  const bool ok = upload(commandId);
+  if (resumeStreaming) applyFrameSize();
+  return ok;
 }
 bool acknowledgeCommand(const String& id) {
   HTTPClient http;
@@ -156,11 +180,7 @@ void pollCommand() {
   if (response.indexOf("\"command\":\"capture\"") >= 0) {
     String id;
     if (!commandId(response, id)) { lastError = "Invalid capture command"; return; }
-    const bool resumeStreaming = remoteStreaming || directLive;
-    sensor_t* sensor = esp_camera_sensor_get();
-    if (resumeStreaming && sensor) sensor->set_framesize(sensor, FRAMESIZE_UXGA);
-    upload(id);
-    if (resumeStreaming) applyFrameSize();
+    captureStill(id);
     return;
   }
   const bool start = response.indexOf("\"command\":\"stream-start\"") >= 0;
@@ -176,7 +196,7 @@ void status() {
 }
 void capture() {
   if (!authorized()) { server.send(401, "application/json", "{\"ok\":false,\"error\":\"Unauthorized\"}"); return; }
-  const bool ok = upload();
+  const bool ok = captureStill();
   server.send(ok ? 202 : 503, "application/json", ok ? "{\"ok\":true,\"accepted\":true}" : String("{\"ok\":false,\"error\":\"") + lastError + "\"}");
 }
 void localLiveControl() {
