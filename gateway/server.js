@@ -16,7 +16,11 @@ let state = { cameraOnline: false, inferenceState: 'idle', catPresent: false, co
 let captureCommand = null;
 let streamCommand = null;
 let streamActive = false;
-const COMMAND_LEASE_MS = 30_000;
+// A command is redelivered once its lease expires, so a sensor that drops offline
+// mid-command still gets it. Attempts are bounded: without a ceiling an unreachable
+// sensor would be handed the same command forever and never surface an error.
+const COMMAND_LEASE_MS = Number(process.env.WATCHCAT_COMMAND_LEASE_MS || 30_000);
+const COMMAND_MAX_ATTEMPTS = Number(process.env.WATCHCAT_COMMAND_MAX_ATTEMPTS || 3);
 
 const json = (res, status, body) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body)); };
 function authorized(req) {
@@ -74,25 +78,33 @@ async function stream(req, res) {
   try {
     const payload = JSON.parse((await body(req)).toString() || '{}');
     if (typeof payload.active !== 'boolean') return json(res, 400, { ok: false, error: 'active must be boolean' });
-    streamCommand = { id: crypto.randomUUID(), active: payload.active, deliveredAt: null };
+    streamCommand = { id: crypto.randomUUID(), active: payload.active, deliveredAt: null, attempts: 0 };
     return json(res, 202, { ok: true, active: payload.active });
   } catch { return json(res, 400, { ok: false, error: 'Invalid JSON' }); }
 }
 async function capture(req, res) {
   if (!authorized(req)) return json(res, 401, { ok: false, error: 'Unauthorized' });
-  if (!captureCommand) captureCommand = { id: crypto.randomUUID(), requestedAt: new Date().toISOString(), deliveredAt: null };
+  if (!captureCommand) captureCommand = { id: crypto.randomUUID(), requestedAt: new Date().toISOString(), deliveredAt: null, attempts: 0 };
   return json(res, 202, { ok: true, accepted: true, requestId: captureCommand.id });
 }
 function nextCommand(req, res) {
   if (!authorized(req)) return json(res, 401, { ok: false, error: 'Unauthorized' });
   const now = Date.now();
-  if (captureCommand && (!captureCommand.deliveredAt || now - captureCommand.deliveredAt >= COMMAND_LEASE_MS)) {
-    captureCommand.deliveredAt = now;
-    return json(res, 200, { ok: true, command: 'capture', id: captureCommand.id, requestedAt: captureCommand.requestedAt });
+  const due = command => command && (!command.deliveredAt || now - command.deliveredAt >= COMMAND_LEASE_MS);
+  const abandon = label => { state = { ...state, lastError: `${label} command abandoned after ${COMMAND_MAX_ATTEMPTS} delivery attempts` }; };
+  if (due(captureCommand)) {
+    if (captureCommand.attempts >= COMMAND_MAX_ATTEMPTS) { abandon('Capture'); captureCommand = null; }
+    else {
+      captureCommand.attempts++; captureCommand.deliveredAt = now;
+      return json(res, 200, { ok: true, command: 'capture', id: captureCommand.id, requestedAt: captureCommand.requestedAt });
+    }
   }
-  if (streamCommand && (!streamCommand.deliveredAt || now - streamCommand.deliveredAt >= COMMAND_LEASE_MS)) {
-    streamCommand.deliveredAt = now;
-    return json(res, 200, { ok: true, command: streamCommand.active ? 'stream-start' : 'stream-stop', id: streamCommand.id });
+  if (due(streamCommand)) {
+    if (streamCommand.attempts >= COMMAND_MAX_ATTEMPTS) { abandon('Stream'); streamCommand = null; }
+    else {
+      streamCommand.attempts++; streamCommand.deliveredAt = now;
+      return json(res, 200, { ok: true, command: streamCommand.active ? 'stream-start' : 'stream-stop', id: streamCommand.id });
+    }
   }
   return json(res, 200, { ok: true, command: null });
 }
@@ -121,7 +133,7 @@ async function serveJpeg(res, filename) {
     return stream.pipe(res);
   } catch (error) { await handle.close(); return json(res, 500, { ok: false, error: error.message }); }
 }
-const page = `<!doctype html><meta charset="utf-8"><title>watchcat</title><style>body{background:#101216;color:white;font:16px system-ui;margin:2rem}main{max-width:720px;margin:auto}strong{font-size:2rem}img{max-width:100%;margin-top:1rem;background:#222;border-radius:12px}.error{color:#ff7777}</style><main><h1>WATCHCAT</h1><strong id=r>Loading…</strong><p id=d></p><button id=b>사진 촬영</button><img id=i alt="최근 사진"><script>const r=document.querySelector('#r'),d=document.querySelector('#d'),i=document.querySelector('#i');async function x(){try{let s=await fetch('/api/v1/status').then(v=>v.json());const v=s.streamActive&&s.liveFilename;r.textContent=v?'LIVE':s.inferenceState==='waiting'||s.inferenceState==='running'?'INFERENCE WAITING':s.catPresent?'CAT FOUND':'NO CAT';d.textContent=s.lastError||(v?'live preview · '+(s.liveAt??'-'):'confidence: '+(s.confidence??'-')+' · '+(s.processedAt??'-'));d.className=s.lastError?'error':'';if(v)i.src='/api/v1/live.jpg?t='+Date.now();else if(s.latestFilename)i.src='/api/v1/latest.jpg?t='+Date.now()}catch(e){r.textContent='GATEWAY ERROR';d.textContent=e.message}}b.onclick=()=>fetch('/api/v1/capture',{method:'POST'}).then(x);setInterval(x,2000);x();</script></main>`;
+const page = `<!doctype html><meta charset="utf-8"><title>watchcat</title><style>body{background:#101216;color:white;font:16px system-ui;margin:2rem}main{max-width:720px;margin:auto}strong{font-size:2rem}img{max-width:100%;margin-top:1rem;background:#222;border-radius:12px}button{margin-right:.5rem}.error{color:#ff7777}</style><main><h1>WATCHCAT</h1><strong id=r>Loading…</strong><p id=d></p><button id=b>사진 촬영</button><button id=l>라이브 시작</button><img id=i alt="최근 사진"><script>const r=document.querySelector('#r'),d=document.querySelector('#d'),i=document.querySelector('#i'),b=document.querySelector('#b'),l=document.querySelector('#l');let on=false,timer=0;async function x(){clearTimeout(timer);try{let s=await fetch('/api/v1/status').then(v=>v.json());on=Boolean(s.streamActive);const v=on&&s.liveFilename;l.textContent=s.streamPending?'대기 중…':on?'라이브 정지':'라이브 시작';r.textContent=v?'LIVE':s.inferenceState==='waiting'||s.inferenceState==='running'?'INFERENCE WAITING':s.catPresent?'CAT FOUND':'NO CAT';d.textContent=v?'live preview · '+(s.liveAt??'-'):s.lastError||'confidence: '+(s.confidence??'-')+' · '+(s.processedAt??'-');d.className=!v&&s.lastError?'error':'';if(v)i.src='/api/v1/live.jpg?t='+Date.now();else if(s.latestFilename)i.src='/api/v1/latest.jpg?t='+Date.now()}catch(e){r.textContent='GATEWAY ERROR';d.textContent=e.message}timer=setTimeout(x,on?700:2000)}b.onclick=()=>fetch('/api/v1/capture',{method:'POST'}).then(x);l.onclick=()=>fetch('/api/v1/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:!on})}).then(x);x();</script></main>`;
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   if (req.method === 'GET' && url.pathname === '/') { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); return res.end(page); }

@@ -20,7 +20,7 @@
 | ReSpeaker | `고양이 어디있나` 음성 명령을 Pi에 전달 | 필수 |
 | 캣모니터 | 개발 중 상태·결과를 물리 화면에서 확인 | 개발 단계용 |
 
-캣모니터는 현재 검증된 TFT 배선을 유지하기 위해 사용한다. 캣센서의 카메라 확장 보드는 TFT의 현재 GPIO 10, 11, 15, 16과 충돌하므로, 최종 운영에서 두 장치를 병합하지 않는다.
+캣모니터는 현재 검증된 TFT 배선을 유지하기 위해 사용한다. 캣센서의 카메라 확장 보드는 TFT가 쓰는 GPIO 10, 11, 13, 14를 각각 XCLK, D6, PCLK, D4로 점유하므로, 최종 운영에서 두 장치를 병합하지 않는다.
 
 ## 최종 데이터 흐름
 
@@ -58,6 +58,10 @@ ReSpeaker
   - 응답: `202`와 촬영 요청 ID. 업로드·추론 완료를 기다리지 않는다.
 - `GET /api/v1/status`
   - 카메라 준비 여부, Wi-Fi 상태, 마지막 촬영/업로드 오류를 반환한다.
+- `POST /api/v1/live`
+  - `{"active": true|false}`로 개발용 라이브뷰를 켜고 끈다. 활성 중에는 프레임 크기를 QVGA로 낮춘다.
+- `GET /api/v1/live.jpg`
+  - 라이브뷰가 활성일 때 JPEG 한 장을 즉시 반환한다. 캣모니터가 mDNS 이름으로 LAN에서 직접 호출하며, Pi를 경유하지 않는다.
 
 ### Pi watchcat 게이트웨이 API
 
@@ -67,15 +71,24 @@ ReSpeaker
   - `Content-Type: image/jpeg`의 사진을 수신한다.
   - 인증 헤더와 촬영 시각·카메라 ID 헤더를 검증한다.
   - 사진을 저장한 뒤 기존 `hailo-camera` 파일 추론 API에 `watchcat-cat` 모델로 요청한다.
+  - `X-Watchcat-Stream: true`가 붙은 프레임은 라이브 프레임으로 취급해 추론하지 않고, `latestFilename`과 분리된 `liveFilename`에만 기록한다. 라이브 프레임이 추론된 사진을 덮어쓰면 웹 UI가 무관한 프레임과 이전 판정 결과를 함께 보여주게 된다.
 - `GET /api/v1/status`
   - `cameraOnline`, `inferenceState`, `catPresent`, `confidence`, `capturedAt`, `processedAt`, `lastError`를 반환한다.
+  - 라이브·명령 상태로 `liveFilename`, `liveAt`, `capturePending`, `streamPending`, `streamActive`를 함께 반환한다.
 - `GET /api/v1/latest.jpg`
-  - 최근 사진을 반환한다.
+  - 추론을 거친 최근 사진만 반환한다. 라이브 프레임은 여기 나타나지 않는다.
+- `GET /api/v1/live.jpg`
+  - 가장 최근 라이브 프레임을 반환한다.
 - `POST /api/v1/capture`
   - 캣모니터 또는 Pi 웹 UI의 요청을 대기 촬영 명령으로 저장한다.
+- `POST /api/v1/stream`
+  - `{"active": true|false}`를 대기 스트림 명령으로 저장한다. Pi 웹 UI의 라이브 버튼이 호출한다.
 - `GET /api/v1/commands/next`
-  - 캣센서가 Bearer 토큰으로 폴링한다. 대기 명령이 있으면 `capture`와 요청 ID를 반환한다.
+  - 캣센서가 Bearer 토큰으로 폴링한다. 대기 명령이 있으면 `capture`, `stream-start`, `stream-stop` 중 하나와 요청 ID를 반환한다.
   - 캣센서는 JPEG 업로드에 요청 ID를 포함하고, 게이트웨이는 수신 성공 시 명령을 완료한다.
+  - 명령은 리스가 만료되면 재전송하되 `WATCHCAT_COMMAND_MAX_ATTEMPTS`회까지만 시도한다. 상한을 넘기면 명령을 폐기하고 `lastError`에 기록한다. 상한이 없으면 응답 없는 센서에 같은 명령을 무한히 재전송하게 된다.
+- `POST /api/v1/commands/ack`
+  - 캣센서가 스트림 명령 수신을 확인한다. 확인 시점에 `streamActive`가 갱신된다.
 
 Wi-Fi SSID, 비밀번호, Pi 주소, API 토큰은 코드에 넣지 않고 각 장치의 로컬 설정 파일/환경변수로 관리한다.
 
@@ -108,8 +121,10 @@ Wi-Fi SSID, 비밀번호, Pi 주소, API 토큰은 코드에 넣지 않고 각 �
 
 - 캣모니터가 TFT, 3개 버튼, debounce를 초기화한다.
 - TFT는 `CAT FOUND`, `NO CAT`, `CAMERA OFFLINE`, `INFERENCE WAITING`, `ERROR`를 표시한다.
-- 버튼 1은 즉시 촬영 요청, 버튼 2는 상태/최근 결과 화면 전환, 버튼 3은 자동 촬영 시작·정지에 사용한다.
-- TFT 핀은 GPIO 15/16/9/10/11, 버튼은 GPIO 5/6/7, `tft.init(240, 280)`, `tft.setRotation(2)`를 유지한다.
+- 버튼 1은 즉시 촬영 요청, 버튼 2는 상태 상세 표시 전환, 버튼 3은 라이브뷰 시작·정지에 사용한다.
+  - 라이브뷰는 캣모니터가 캣센서의 `GET /api/v1/live.jpg`를 직접 호출해 표시하며, 이때만 `setRotation(1)`로 가로 방향을 쓴다. 자동 촬영 반복은 Phase 5로 미룬다.
+- TFT 핀은 SCK=GPIO13, MOSI=GPIO14, CS=GPIO11, DC=GPIO10, RST=GPIO9, 버튼은 GPIO 5/6/7, `tft.init(240, 280)`, `tft.setRotation(2)`를 유지한다.
+  - TFT는 전용 HSPI 인스턴스를 쓴다. 전역 `SPI`를 넘기면 Adafruit 초기화가 `SPI.begin()`을 다시 호출해 보드 기본 핀으로 되돌린다.
 
 완료 기준: 버튼으로 촬영을 시작하고, Pi의 추론 결과가 TFT와 웹 UI에 일치하게 표시된다.
 
