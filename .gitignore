@@ -18,3 +18,7 @@ gateway/.env
 # run-profile.md, and named a GENERATED.md that is never created.
 # Scoped to crews/ so .claude/settings.json and friends stay trackable.
 .claude/crews/
+
+# TEMPORARY: another session is still editing CLAUDE.md. Normally this file is
+# committed — drop this entry once that work settles.
+CLAUDE.md
