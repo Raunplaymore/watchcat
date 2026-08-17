@@ -202,7 +202,10 @@ void setup() {
   xTaskCreate(buttonTask, "buttons", 2048, nullptr, 2, nullptr);
   tftSpi.begin(13, -1, 14, 11);
   tft.init(240, 280); tft.setRotation(2);
-  TJpgDec.setJpgScale(1); TJpgDec.setSwapBytes(true); TJpgDec.setCallback(tftOutput);
+  // No pre-swap: the decoder hands drawRGBBitmap() native uint16_t RGB565 and
+  // Adafruit_SPITFT byte-swaps on its way to the panel. Pre-swapping here made that a
+  // double swap, which decoded the geometry correctly but painted it in neon colors.
+  TJpgDec.setJpgScale(1); TJpgDec.setSwapBytes(false); TJpgDec.setCallback(tftOutput);
   draw(); wifi();
 }
 void loop() {
