@@ -6,6 +6,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <TJpg_Decoder.h>
+#include "waiting_bitmap.h"
 #if __has_include("watchcat_config.h")
 #include "watchcat_config.h"
 #else
@@ -40,7 +41,10 @@ uint32_t lastPoll = 0;
 // ever registered and an ordinary tap was dropped between polls.
 volatile bool pressLatched[] = {false, false, false};
 bool detail = false, liveView = false;
-String title = "INFERENCE WAITING", message = "Booting";
+// The waiting state is drawn from a Hangul bitmap, so it is matched by this marker
+// rather than printed as text. Every other title is ASCII and prints normally.
+constexpr char kWaiting[] = "WAITING";
+String title = kWaiting, message = "Booting";
 
 bool wifi() {
   if (WiFi.status() == WL_CONNECTED) return true;
@@ -62,7 +66,9 @@ bool beginGateway(HTTPClient& http, WiFiClientSecure& secureClient, const String
 void draw() {
   const uint16_t color = title == "CAT FOUND" ? ST77XX_RED : title == "NO CAT" ? ST77XX_GREEN : title == "ERROR" ? ST77XX_RED : ST77XX_YELLOW;
   tft.fillScreen(ST77XX_BLACK); tft.setTextWrap(true); tft.setTextColor(color); tft.setTextSize(2); tft.setCursor(12, 20); tft.println("WATCHCAT"); tft.drawFastHLine(12, 50, 216, color);
-  tft.setTextSize(3); tft.setCursor(12, 75); tft.println(title); tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1); tft.setCursor(12, 170); tft.println(message);
+  if (title == kWaiting) tft.drawBitmap(12, 72, kWaitingBitmap, kWaitingBitmapWidth, kWaitingBitmapHeight, color);
+  else { tft.setTextSize(3); tft.setCursor(12, 75); tft.println(title); }
+  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1); tft.setCursor(12, 170); tft.println(message);
   tft.setCursor(12, 235); tft.print("B1 Capture B2 Page B3 Live:"); tft.println(liveView ? "ON" : "OFF");
 }
 bool tftOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* pixels) {
@@ -76,7 +82,7 @@ void capture() {
   if (!beginGateway(http, secureClient, String(WATCHCAT_MONITOR_BASE_URL) + "/api/v1/capture")) { title = "ERROR"; message = "Gateway TLS unavailable"; draw(); return; }
   http.addHeader("Content-Type", "application/json");
   if (strlen(WATCHCAT_CAMERA_TOKEN)) http.addHeader("Authorization", String("Bearer ") + WATCHCAT_CAMERA_TOKEN);
-  const int code = http.POST("{}"); http.end(); title = code >= 200 && code < 300 ? "INFERENCE WAITING" : "ERROR"; message = code >= 200 && code < 300 ? "Capture requested" : "Capture request failed"; draw();
+  const int code = http.POST("{}"); http.end(); title = code >= 200 && code < 300 ? kWaiting : "ERROR"; message = code >= 200 && code < 300 ? "Capture requested" : "Capture request failed"; draw();
 }
 void poll() {
   if (!wifi()) { title = "CAMERA OFFLINE"; message = "Pi Wi-Fi unavailable"; draw(); return; }
@@ -89,7 +95,7 @@ void poll() {
   // the sensor polls every 2s, so the gateway keeps serving the old completed result
   // for seconds after B1. Showing it made a fresh capture look like an instant NO CAT.
   const bool stale = boolIn(body, "capturePending", true) || body.indexOf("\"inferenceState\":\"waiting\"") >= 0 || body.indexOf("\"inferenceState\":\"running\"") >= 0;
-  title = stale ? "INFERENCE WAITING" : boolIn(body, "catPresent", true) ? "CAT FOUND" : body.indexOf("\"inferenceState\":\"error\"") >= 0 ? "ERROR" : boolIn(body, "cameraOnline", true) ? "NO CAT" : "CAMERA OFFLINE";
+  title = stale ? kWaiting : boolIn(body, "catPresent", true) ? "CAT FOUND" : body.indexOf("\"inferenceState\":\"error\"") >= 0 ? "ERROR" : boolIn(body, "cameraOnline", true) ? "NO CAT" : "CAMERA OFFLINE";
   message = detail ? body.substring(0, 90) : "Pi status received"; draw();
 }
 bool setLiveView(bool active) {
@@ -165,7 +171,7 @@ void loop() {
     if (setLiveView(requested)) {
       liveView = requested;
       tft.setRotation(liveView ? 1 : 2);
-      title = liveView ? "LIVE VIEW" : "INFERENCE WAITING"; message = liveView ? "Connecting direct" : "Live stream stopped"; draw();
+      title = liveView ? "LIVE VIEW" : kWaiting; message = liveView ? "Connecting direct" : "Live stream stopped"; draw();
     }
     else { title = "ERROR"; message = "Live request failed"; draw(); }
   }

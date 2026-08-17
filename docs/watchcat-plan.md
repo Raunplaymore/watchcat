@@ -120,7 +120,9 @@ Wi-Fi SSID, 비밀번호, Pi 주소, API 토큰은 코드에 넣지 않고 각 �
 목표: 물리 장치에서 Phase 1 결과를 확인하고 촬영을 시작한다.
 
 - 캣모니터가 TFT, 3개 버튼, debounce를 초기화한다.
-- TFT는 `CAT FOUND`, `NO CAT`, `CAMERA OFFLINE`, `INFERENCE WAITING`, `ERROR`를 표시한다.
+- TFT는 `CAT FOUND`, `NO CAT`, `CAMERA OFFLINE`, `ERROR`와 대기 상태를 표시한다.
+  - 대기 문구는 `오월이 어딧나...?`이며, Adafruit GFX의 내장 폰트가 ASCII 전용이라 미리 렌더링한 1비트 비트맵(`src/display_node/waiting_bitmap.h`)을 `drawBitmap()`으로 그린다. 한글 문구를 더 추가할 때도 같은 방식을 쓴다.
+  - 촬영 명령이 대기 중(`capturePending`)이면 판정 대신 대기 문구를 표시한다. 센서가 2초 주기로 폴링하므로 그 사이 게이트웨이는 직전 사진의 판정을 계속 응답한다.
 - 버튼 1은 즉시 촬영 요청, 버튼 2는 상태 상세 표시 전환, 버튼 3은 라이브뷰 시작·정지에 사용한다.
   - 라이브뷰는 캣모니터가 캣센서의 `GET /api/v1/live.jpg`를 직접 호출해 표시하며, 이때만 `setRotation(1)`로 가로 방향을 쓴다. 자동 촬영 반복은 Phase 5로 미룬다.
 - TFT 핀은 SCK=GPIO13, MOSI=GPIO14, CS=GPIO11, DC=GPIO10, RST=GPIO9, 버튼은 GPIO 5/6/7, `tft.init(240, 280)`, `tft.setRotation(2)`를 유지한다.
