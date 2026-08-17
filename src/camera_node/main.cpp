@@ -76,6 +76,32 @@ bool wifi(uint32_t timeout = 15000) {
 bool authorized() {
   return !strlen(WATCHCAT_CAMERA_TOKEN) || server.header("Authorization") == String("Bearer ") + WATCHCAT_CAMERA_TOKEN;
 }
+void tune(const char* name, int result) {
+  if (result != 0) Serial.printf("Sensor tuning rejected: %s\n", name);
+}
+// Auto white balance and auto gain are not on by default here. Without them the
+// OV3660 leaves blue far under green — a measured G/B of 3.4, which reads as a
+// heavy green cast — and never lifts gain, so frames averaged 59/255 with no
+// pixel anywhere near clipping. Every setter reports failure instead of being
+// dropped silently, since a rejected value looks identical to a bad scene.
+void tuneSensor(sensor_t* sensor) {
+  tune("vflip", sensor->set_vflip(sensor, 1));
+  tune("whitebal", sensor->set_whitebal(sensor, 1));
+  tune("awb_gain", sensor->set_awb_gain(sensor, 1));
+  tune("wb_mode", sensor->set_wb_mode(sensor, 4));  // 4 = home/indoor preset
+  tune("exposure_ctrl", sensor->set_exposure_ctrl(sensor, 1));
+  tune("aec2", sensor->set_aec2(sensor, 1));
+  // ae_level 2 / GAINCEILING_32X was measured to change nothing here (luminance
+  // stayed at 39/255) and coincided with a truncated 41 KB UXGA frame, so the
+  // ceiling stays at 16X. Brightening this scene needs exposure time, not gain.
+  tune("ae_level", sensor->set_ae_level(sensor, 1));
+  tune("gain_ctrl", sensor->set_gain_ctrl(sensor, 1));
+  tune("gainceiling", sensor->set_gainceiling(sensor, GAINCEILING_16X));
+  tune("brightness", sensor->set_brightness(sensor, 1));
+  tune("contrast", sensor->set_contrast(sensor, 1));
+  tune("sharpness", sensor->set_sharpness(sensor, 2));
+  tune("denoise", sensor->set_denoise(sensor, 4));
+}
 // The sensor keeps emitting the previous geometry for a frame after a framesize
 // change, and with fb_count=1 the next fb_get hands that stale buffer straight to
 // the caller. Drain until the geometry settles: the monitor silently drops frames
@@ -226,14 +252,7 @@ void setup() {
   if (!cameraReady) { lastError = "Camera initialization failed"; Serial.println(lastError); }
   else {
     sensor_t* sensor = esp_camera_sensor_get();
-    if (sensor) {
-      sensor->set_vflip(sensor, 1);
-      sensor->set_aec2(sensor, 1);
-      sensor->set_brightness(sensor, 1);
-      sensor->set_contrast(sensor, 1);
-      sensor->set_sharpness(sensor, 2);
-      sensor->set_denoise(sensor, 0);
-    }
+    if (sensor) tuneSensor(sensor);
     Serial.println("Camera initialized");
   }
   wifi();
