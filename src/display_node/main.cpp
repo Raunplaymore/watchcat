@@ -35,21 +35,38 @@ namespace {
 // restores the board defaults. A dedicated HSPI instance preserves this map.
 SPIClass tftSpi(HSPI);
 Adafruit_ST7789 tft(&tftSpi, 11, 10, 9);
+
+// Three buttons are a navigation set, not three independent actions: B1 and B3 move
+// between pages and B2 runs the current page's action. Adding a feature adds a page
+// instead of competing for a button.
 constexpr int kButtons[] = {5, 6, 7};
-constexpr uint32_t kDebounceMs = 40, kPollMs = 2000, kLivePollMs = 150, kButtonSampleMs = 10;
-uint32_t lastPoll = 0;
-// Presses are latched by a sampling task, not read from loop(). A status poll is a
+enum Button : uint8_t { ButtonPrev, ButtonSelect, ButtonNext };
+enum Page : uint8_t { PageStatus, PagePhoto, PageLive, PageDetail, PageCount };
+
+constexpr uint32_t kDebounceMs = 40, kStatusPollMs = 2000, kLiveFrameMs = 150, kButtonSampleMs = 10;
+// A still is UXGA, far larger than a live frame, so it gets its own ceiling and is
+// decoded at 1/8 scale to fit the panel.
+constexpr int kMaxLiveBytes = 120000, kMaxPhotoBytes = 320000;
+constexpr int kPhotoScale = 8, kPhotoWidth = 1600 / kPhotoScale, kPhotoHeight = 1200 / kPhotoScale;
+
+// Presses are latched by a sampling task, not read from loop(). A page action is a
 // blocking TLS request that can hold loop() for seconds, and the poll timer fires
 // again the moment it returns, so loop() sampled the pins roughly once per poll.
 // Debounce needs two samples of a held button, which meant only a multi-second hold
 // ever registered and an ordinary tap was dropped between polls.
 volatile bool pressLatched[] = {false, false, false};
+
 bool mdnsStarted = false;
 IPAddress sensorIp;
 uint32_t sensorIpAt = 0;
 constexpr uint32_t kSensorIpTtlMs = 60000;
+
 uint32_t liveFrames = 0, liveFetchMs = 0, liveDrawMs = 0, liveStatAt = 0;
-bool detail = false, liveView = false;
+uint32_t lastStatusPoll = 0, lastLiveFrame = 0;
+
+uint8_t page = PageStatus;
+bool livePaused = false;
+String statusBody;  // last gateway status JSON, shared by the status and detail pages
 // The waiting state is drawn from a Hangul bitmap, so it is matched by this marker
 // rather than printed as text. Every other title is ASCII and prints normally.
 constexpr char kWaiting[] = "WAITING";
@@ -63,6 +80,24 @@ bool wifi() {
   return WiFi.status() == WL_CONNECTED;
 }
 bool boolIn(const String& value, const char* key, bool expected) { return value.indexOf(String("\"") + key + "\":" + (expected ? "true" : "false")) >= 0; }
+// Pulls one value out of the gateway's status JSON. The detail page needs the numbers
+// themselves; printing a prefix of the raw body cut off inside "confidence" and showed
+// the key without ever reaching its value.
+String jsonValue(const String& body, const char* key) {
+  const String needle = String("\"") + key + "\":";
+  int at = body.indexOf(needle);
+  if (at < 0) return String();
+  at += needle.length();
+  if (at < static_cast<int>(body.length()) && body[at] == '"') {
+    const int end = body.indexOf('"', at + 1);
+    return end < 0 ? String() : body.substring(at + 1, end);
+  }
+  int end = at;
+  while (end < static_cast<int>(body.length()) && body[end] != ',' && body[end] != '}') end++;
+  const String raw = body.substring(at, end);
+  return raw == "null" ? String() : raw;
+}
+String orDash(const String& value) { return value.length() ? value : String("-"); }
 bool beginGateway(HTTPClient& http, WiFiClientSecure& secureClient, const String& endpoint) {
   http.setConnectTimeout(5000); http.setTimeout(15000);
   if (endpoint.startsWith("https://")) {
@@ -72,41 +107,102 @@ bool beginGateway(HTTPClient& http, WiFiClientSecure& secureClient, const String
   }
   return http.begin(endpoint);
 }
-void draw() {
-  const uint16_t color = title == "CAT FOUND" ? ST77XX_RED : title == "NO CAT" ? ST77XX_GREEN : title == "ERROR" ? ST77XX_RED : ST77XX_YELLOW;
-  tft.fillScreen(ST77XX_BLACK); tft.setTextWrap(true); tft.setTextColor(color); tft.setTextSize(2); tft.setCursor(12, 20); tft.println("WATCHCAT"); tft.drawFastHLine(12, 50, 216, color);
-  if (title == kWaiting) tft.drawBitmap(12, 72, kWaitingBitmap, kWaitingBitmapWidth, kWaitingBitmapHeight, color);
-  else { tft.setTextSize(3); tft.setCursor(12, 75); tft.println(title); }
-  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1); tft.setCursor(12, 170); tft.println(message);
-  tft.setCursor(12, 235); tft.print("B1 Capture B2 Page B3 Live:"); tft.println(liveView ? "ON" : "OFF");
-}
 bool tftOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t* pixels) {
   if (y >= tft.height()) return false;
   tft.drawRGBBitmap(x, y, pixels, w, h);
   return true;
 }
+
+const char* pageName(uint8_t p) {
+  switch (p) {
+    case PageStatus: return "STATUS";
+    case PagePhoto: return "PHOTO";
+    case PageLive: return "LIVE";
+    default: return "DETAIL";
+  }
+}
+const char* selectLabel(uint8_t p) {
+  switch (p) {
+    case PageStatus: return "CAPTURE";
+    case PagePhoto: return "RELOAD";
+    case PageLive: return livePaused ? "RESUME" : "PAUSE";
+    default: return "REFRESH";
+  }
+}
+// Always states the current page and what B2 will do, so the label can never drift from
+// the behaviour the way a fixed "B2 Page" caption did.
+void drawChrome(uint16_t color) {
+  tft.setTextWrap(false);
+  tft.setTextColor(color); tft.setTextSize(2); tft.setCursor(12, 20); tft.print("WATCHCAT");
+  tft.drawFastHLine(12, 50, 216, color);
+  tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE);
+  tft.setCursor(12, 252); tft.printf("< %s >", pageName(page));
+  tft.setCursor(12, 266); tft.printf("B2: %s", selectLabel(page));
+}
+void drawStatusPage() {
+  const uint16_t color = title == "CAT FOUND" ? ST77XX_RED : title == "NO CAT" ? ST77XX_GREEN : title == "ERROR" ? ST77XX_RED : ST77XX_YELLOW;
+  tft.fillScreen(ST77XX_BLACK);
+  drawChrome(color);
+  if (title == kWaiting) tft.drawBitmap(12, 82, kWaitingBitmap, kWaitingBitmapWidth, kWaitingBitmapHeight, color);
+  else { tft.setTextColor(color); tft.setTextSize(3); tft.setCursor(12, 85); tft.print(title); }
+  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1); tft.setTextWrap(true); tft.setCursor(12, 170); tft.print(message);
+}
+void drawDetailPage() {
+  tft.fillScreen(ST77XX_BLACK);
+  drawChrome(ST77XX_CYAN);
+  const String conf = jsonValue(statusBody, "confidence");
+  const String done = jsonValue(statusBody, "processedAt");
+  struct { const char* label; String value; } rows[] = {
+    {"CONF",  orDash(conf.length() ? conf.substring(0, 5) : conf)},
+    {"STATE", orDash(jsonValue(statusBody, "inferenceState"))},
+    {"CAT",   boolIn(statusBody, "catPresent", true) ? "yes" : "no"},
+    {"SHOT",  orDash(jsonValue(statusBody, "capturedAt"))},
+    {"DONE",  orDash(done.length() >= 19 ? done.substring(11, 19) : done)},
+    {"CAM",   sensorIp == IPAddress() ? String("unresolved") : sensorIp.toString()},
+    {"WIFI",  WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) + " dBm" : String("down")},
+    {"ERR",   orDash(jsonValue(statusBody, "lastError"))},
+  };
+  tft.setTextSize(1); tft.setTextWrap(false);
+  int y = 70;
+  for (const auto& row : rows) {
+    tft.setTextColor(ST77XX_CYAN); tft.setCursor(12, y); tft.print(row.label);
+    tft.setTextColor(ST77XX_WHITE); tft.setCursor(70, y); tft.print(row.value);
+    y += 14;
+  }
+}
+void render() {
+  if (page == PageStatus) drawStatusPage();
+  else if (page == PageDetail) drawDetailPage();
+}
+
 void capture() {
-  if (!wifi()) { title = "ERROR"; message = "Wi-Fi unavailable"; draw(); return; }
+  if (!wifi()) { title = "ERROR"; message = "Wi-Fi unavailable"; return; }
   HTTPClient http; WiFiClientSecure secureClient;
-  if (!beginGateway(http, secureClient, String(WATCHCAT_MONITOR_BASE_URL) + "/api/v1/capture")) { title = "ERROR"; message = "Gateway TLS unavailable"; draw(); return; }
+  if (!beginGateway(http, secureClient, String(WATCHCAT_MONITOR_BASE_URL) + "/api/v1/capture")) { title = "ERROR"; message = "Gateway TLS unavailable"; return; }
   http.addHeader("Content-Type", "application/json");
   if (strlen(WATCHCAT_CAMERA_TOKEN)) http.addHeader("Authorization", String("Bearer ") + WATCHCAT_CAMERA_TOKEN);
-  const int code = http.POST("{}"); http.end(); title = code >= 200 && code < 300 ? kWaiting : "ERROR"; message = code >= 200 && code < 300 ? "Capture requested" : "Capture request failed"; draw();
+  const int code = http.POST("{}"); http.end();
+  const bool ok = code >= 200 && code < 300;
+  title = ok ? kWaiting : "ERROR"; message = ok ? "Capture requested" : "Capture request failed";
 }
-void poll() {
-  if (!wifi()) { title = "CAMERA OFFLINE"; message = "Pi Wi-Fi unavailable"; draw(); return; }
+void pollStatus() {
+  if (!wifi()) { title = "CAMERA OFFLINE"; message = "Pi Wi-Fi unavailable"; return; }
   HTTPClient http; WiFiClientSecure secureClient;
-  if (!beginGateway(http, secureClient, String(WATCHCAT_MONITOR_BASE_URL) + "/api/v1/status")) { title = "CAMERA OFFLINE"; message = "Gateway TLS unavailable"; draw(); return; }
+  if (!beginGateway(http, secureClient, String(WATCHCAT_MONITOR_BASE_URL) + "/api/v1/status")) { title = "CAMERA OFFLINE"; message = "Gateway TLS unavailable"; return; }
   if (strlen(WATCHCAT_CAMERA_TOKEN)) http.addHeader("Authorization", String("Bearer ") + WATCHCAT_CAMERA_TOKEN);
   const int code = http.GET(); const String body = code == 200 ? http.getString() : ""; http.end();
-  if (code != 200) { title = "CAMERA OFFLINE"; message = "Gateway unavailable"; draw(); return; }
+  if (code != 200) { title = "CAMERA OFFLINE"; message = "Gateway unavailable"; return; }
+  statusBody = body;
   // A queued capture means the reported verdict still belongs to the previous photo:
   // the sensor polls every 2s, so the gateway keeps serving the old completed result
-  // for seconds after B1. Showing it made a fresh capture look like an instant NO CAT.
+  // for seconds after a capture. Showing it made a fresh capture look like an instant
+  // NO CAT.
   const bool stale = boolIn(body, "capturePending", true) || body.indexOf("\"inferenceState\":\"waiting\"") >= 0 || body.indexOf("\"inferenceState\":\"running\"") >= 0;
   title = stale ? kWaiting : boolIn(body, "catPresent", true) ? "CAT FOUND" : body.indexOf("\"inferenceState\":\"error\"") >= 0 ? "ERROR" : boolIn(body, "cameraOnline", true) ? "NO CAT" : "CAMERA OFFLINE";
-  message = detail ? body.substring(0, 90) : "Pi status received"; draw();
+  const String conf = jsonValue(body, "confidence");
+  message = stale ? "Waiting for the sensor" : conf.length() ? "confidence " + conf.substring(0, 5) : "Pi status received";
 }
+
 // The sensor advertises watchcat-sensor.local over mDNS, but this board carried no
 // mDNS resolver, so the name fell through to the ISP's DNS — which answers NXDOMAIN
 // with an ad server. Live view was fetching from that server and handing its reply
@@ -144,39 +240,67 @@ bool setLiveView(bool active) {
   const int code = http.POST(active ? "{\"active\":true}" : "{\"active\":false}"); http.end();
   return code >= 200 && code < 300;
 }
+// Fetches a JPEG into a caller-owned buffer. Returns 0 on failure. Only accepts a real
+// JPEG: anything else on these endpoints — a captive portal, an ISP error page — used to
+// be pushed straight to the decoder and painted as garbage.
+size_t fetchJpeg(const String& endpoint, uint8_t** out, int maxBytes) {
+  *out = nullptr;
+  HTTPClient http; WiFiClientSecure secureClient;
+  if (!beginGateway(http, secureClient, endpoint)) return 0;
+  if (strlen(WATCHCAT_CAMERA_TOKEN)) http.addHeader("Authorization", String("Bearer ") + WATCHCAT_CAMERA_TOKEN);
+  const int code = http.GET();
+  const int size = http.getSize();
+  if (code != 200 || size <= 4 || size > maxBytes) { http.end(); return 0; }
+  uint8_t* buffer = static_cast<uint8_t*>(ps_malloc(size));  // PSRAM when the board has it
+  if (!buffer) buffer = static_cast<uint8_t*>(malloc(size));
+  if (!buffer) { http.end(); return 0; }
+  const size_t read = http.getStreamPtr()->readBytes(buffer, size);
+  http.end();
+  if (read != static_cast<size_t>(size) || buffer[0] != 0xFF || buffer[1] != 0xD8 || buffer[2] != 0xFF) {
+    free(buffer);
+    return 0;
+  }
+  *out = buffer;
+  return read;
+}
+void drawPhotoPage() {
+  tft.fillScreen(ST77XX_BLACK);
+  drawChrome(ST77XX_YELLOW);
+  tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE); tft.setCursor(12, 70);
+  if (!wifi()) { tft.print("Wi-Fi unavailable"); return; }
+  tft.print("Loading...");
+  uint8_t* jpeg = nullptr;
+  const size_t bytes = fetchJpeg(String(WATCHCAT_MONITOR_BASE_URL) + "/api/v1/latest.jpg", &jpeg, kMaxPhotoBytes);
+  tft.fillRect(0, 60, tft.width(), 190, ST77XX_BLACK);
+  if (!bytes) {
+    tft.setCursor(12, 70); tft.print("No photo available");
+    return;
+  }
+  TJpgDec.setJpgScale(kPhotoScale);
+  TJpgDec.drawJpg((tft.width() - kPhotoWidth) / 2, 80, jpeg, bytes);
+  TJpgDec.setJpgScale(1);
+  free(jpeg);
+  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1); tft.setCursor(12, 236);
+  tft.printf("%s  %s", title == kWaiting ? "PENDING" : title.c_str(), orDash(jsonValue(statusBody, "confidence").substring(0, 5)).c_str());
+}
 void showLiveFrame() {
   if (!wifi()) return;
   const String base = sensorBase();
   if (!base.length()) return;
   const uint32_t fetchStart = millis();
-  HTTPClient http; WiFiClientSecure secureClient;
-  const String endpoint = base + "/api/v1/live.jpg";
-  if (!beginGateway(http, secureClient, endpoint)) return;
-  if (strlen(WATCHCAT_CAMERA_TOKEN)) http.addHeader("Authorization", String("Bearer ") + WATCHCAT_CAMERA_TOKEN);
-  const int code = http.GET();
-  const int size = http.getSize();
-  if (code != 200 || size <= 0 || size > 120000) { http.end(); return; }
-  uint8_t* jpeg = static_cast<uint8_t*>(malloc(size));
-  if (!jpeg) { http.end(); return; }
-  WiFiClient* stream = http.getStreamPtr();
-  const size_t read = stream->readBytes(jpeg, size);
-  http.end();
+  uint8_t* jpeg = nullptr;
+  const size_t bytes = fetchJpeg(base + "/api/v1/live.jpg", &jpeg, kMaxLiveBytes);
   liveFetchMs += millis() - fetchStart;
-  // Only decode something that is actually a JPEG. Anything else on this endpoint —
-  // a captive portal, an ISP error page — used to be pushed straight to the decoder
-  // and painted as garbage.
-  const bool isJpeg = size >= 4 && jpeg[0] == 0xFF && jpeg[1] == 0xD8 && jpeg[2] == 0xFF;
-  if (read == static_cast<size_t>(size) && isJpeg) {
-    const uint32_t drawStart = millis();
-    // No clear between frames. The frame covers every visible pixel, so clearing first
-    // only pushed another 134 KB over SPI — roughly doubling the per-frame draw cost —
-    // and the black flash it left behind is what made the stream look like it was
-    // repainting rather than moving.
-    TJpgDec.drawJpg(-20, 0, jpeg, size);
-    tft.setTextColor(ST77XX_CYAN); tft.setTextSize(1); tft.setCursor(8, 8); tft.print("LIVE  B3 STOP");
-    liveDrawMs += millis() - drawStart;
-    liveFrames++;
-  }
+  if (!bytes) return;
+  const uint32_t drawStart = millis();
+  // No clear between frames. The frame covers every visible pixel, so clearing first
+  // only pushed another 134 KB over SPI — roughly doubling the per-frame draw cost —
+  // and the black flash it left behind is what made the stream look like it was
+  // repainting rather than moving.
+  TJpgDec.drawJpg(-20, 0, jpeg, bytes);
+  tft.setTextColor(ST77XX_CYAN); tft.setTextSize(1); tft.setCursor(8, 8); tft.print("LIVE  B1/B3 EXIT  B2 PAUSE");
+  liveDrawMs += millis() - drawStart;
+  liveFrames++;
   free(jpeg);
   if (millis() - liveStatAt >= 2000) {
     if (liveFrames) Serial.printf("Live: %.1f fps  fetch %lums  draw %lums (avg over %lu frames)\n",
@@ -187,6 +311,52 @@ void showLiveFrame() {
     liveStatAt = millis(); liveFrames = 0; liveFetchMs = 0; liveDrawMs = 0;
   }
 }
+void drawLivePaused() {
+  tft.setTextColor(ST77XX_YELLOW); tft.setTextSize(2); tft.setCursor(8, 8); tft.print("PAUSED");
+}
+
+// Live view owns the landscape orientation and asks the sensor to drop to QVGA, so both
+// are handed back on the way out rather than left set for the other pages.
+void leavePage(uint8_t from) {
+  if (from != PageLive) return;
+  setLiveView(false);
+  tft.setRotation(2);
+}
+void enterPage(uint8_t to) {
+  if (to == PageLive) {
+    livePaused = false;
+    tft.setRotation(1);
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setTextColor(ST77XX_CYAN); tft.setTextSize(1); tft.setCursor(8, 8); tft.print("Starting live view...");
+    if (!setLiveView(true)) {
+      tft.fillScreen(ST77XX_BLACK);
+      tft.setTextColor(ST77XX_RED); tft.setTextSize(2); tft.setCursor(8, 8); tft.print("SENSOR");
+      tft.setCursor(8, 30); tft.print("UNREACHABLE");
+    }
+    lastLiveFrame = 0;
+    return;
+  }
+  if (to == PagePhoto) { drawPhotoPage(); return; }
+  render();
+}
+void movePage(int delta) {
+  const uint8_t from = page;
+  leavePage(from);
+  page = (page + delta + PageCount) % PageCount;
+  enterPage(page);
+}
+void selectOnPage() {
+  switch (page) {
+    case PageStatus: capture(); render(); break;
+    case PagePhoto: drawPhotoPage(); break;
+    case PageLive:
+      livePaused = !livePaused;
+      if (livePaused) drawLivePaused();
+      break;
+    default: pollStatus(); render(); break;
+  }
+}
+
 // Runs independently of loop(), so a tap during a blocking request is still seen.
 void buttonTask(void*) {
   bool lastRead[] = {HIGH, HIGH, HIGH}, stable[] = {HIGH, HIGH, HIGH};
@@ -215,7 +385,7 @@ bool pressed(int index) {
 void setup() {
   Serial.begin(115200); delay(200);
   for (int pin : kButtons) pinMode(pin, INPUT_PULLUP);
-  Serial.printf("Buttons ready: B1=%d B2=%d B3=%d\n", kButtons[0], kButtons[1], kButtons[2]);
+  Serial.printf("Buttons ready: B1=prev(%d) B2=select(%d) B3=next(%d)\n", kButtons[0], kButtons[1], kButtons[2]);
   xTaskCreate(buttonTask, "buttons", 2048, nullptr, 2, nullptr);
   tftSpi.begin(13, -1, 14, 11);
   tft.init(240, 280); tft.setRotation(2);
@@ -227,21 +397,20 @@ void setup() {
   // Adafruit_SPITFT byte-swaps on its way to the panel. Pre-swapping here made that a
   // double swap, which decoded the geometry correctly but painted it in neon colors.
   TJpgDec.setJpgScale(1); TJpgDec.setSwapBytes(false); TJpgDec.setCallback(tftOutput);
-  draw(); wifi();
+  render(); wifi();
 }
 void loop() {
-  if (pressed(0)) capture();
-  if (pressed(1)) { detail = !detail; draw(); }
-  if (pressed(2)) {
-    const bool requested = !liveView;
-    if (setLiveView(requested)) {
-      liveView = requested;
-      tft.setRotation(liveView ? 1 : 2);
-      title = liveView ? "LIVE VIEW" : kWaiting; message = liveView ? "Connecting direct" : "Live stream stopped"; draw();
-    }
-    else { title = "ERROR"; message = "Live request failed"; draw(); }
+  if (pressed(ButtonPrev)) movePage(-1);
+  if (pressed(ButtonNext)) movePage(1);
+  if (pressed(ButtonSelect)) selectOnPage();
+  if (page == PageLive) {
+    if (!livePaused && millis() - lastLiveFrame >= kLiveFrameMs) { lastLiveFrame = millis(); showLiveFrame(); }
+  } else if (millis() - lastStatusPoll >= kStatusPollMs) {
+    lastStatusPoll = millis();
+    pollStatus();
+    // Only the pages that show status text need repainting on a poll. Redrawing the
+    // photo page here would refetch a UXGA still every two seconds.
+    if (page == PageStatus || page == PageDetail) render();
   }
-  if (liveView && millis() - lastPoll >= kLivePollMs) { lastPoll = millis(); showLiveFrame(); }
-  if (!liveView && millis() - lastPoll >= kPollMs) { lastPoll = millis(); poll(); }
   delay(5);
 }
