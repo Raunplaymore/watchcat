@@ -93,12 +93,22 @@ void tuneSensor(sensor_t* sensor) {
   tune("aec2", sensor->set_aec2(sensor, 1));
   // ae_level 2 / GAINCEILING_32X was measured to change nothing here (luminance
   // stayed at 39/255) and coincided with a truncated 41 KB UXGA frame, so the
-  // ceiling stays at 16X. Brightening this scene needs exposure time, not gain.
+  // ceiling stays at 16X. Brightening this scene needs tone mapping, not gain.
   tune("ae_level", sensor->set_ae_level(sensor, 1));
   tune("gain_ctrl", sensor->set_gain_ctrl(sensor, 1));
   tune("gainceiling", sensor->set_gainceiling(sensor, GAINCEILING_16X));
-  tune("brightness", sensor->set_brightness(sensor, 1));
-  tune("contrast", sensor->set_contrast(sensor, 1));
+  // Tone and correction stages the driver leaves off. Correcting this camera's
+  // cast and flat midtones in post was what lifted a cat from undetected to
+  // conf 0.274 on the same frame, so the same work belongs in the sensor: gamma
+  // lifts midtones, lens correction evens the falloff, and pixel correction
+  // keeps amplified sensor defects out of the frame.
+  tune("raw_gma", sensor->set_raw_gma(sensor, 1));
+  tune("lenc", sensor->set_lenc(sensor, 1));
+  tune("bpc", sensor->set_bpc(sensor, 1));
+  tune("wpc", sensor->set_wpc(sensor, 1));
+  tune("brightness", sensor->set_brightness(sensor, 2));
+  tune("contrast", sensor->set_contrast(sensor, 2));
+  tune("saturation", sensor->set_saturation(sensor, 1));
   tune("sharpness", sensor->set_sharpness(sensor, 2));
   tune("denoise", sensor->set_denoise(sensor, 4));
 }
