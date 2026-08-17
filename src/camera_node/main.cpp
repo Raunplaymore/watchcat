@@ -131,8 +131,15 @@ void setFrameSize(framesize_t size) {
   lastError = "Frame size did not settle";
 }
 void applyFrameSize() { setFrameSize((remoteStreaming || directLive) ? FRAMESIZE_QVGA : FRAMESIZE_UXGA); }
+// The advertisement does not survive a Wi-Fi reconnect, and the monitor resolves the
+// sensor by this name, so tear it down on disconnect and register again once the link
+// is back. Leaving mdnsStarted latched was leaving the name unresolvable.
 void ensureMdns() {
-  if (mdnsStarted || WiFi.status() != WL_CONNECTED) return;
+  if (WiFi.status() != WL_CONNECTED) {
+    if (mdnsStarted) { MDNS.end(); mdnsStarted = false; Serial.println("mDNS stopped: Wi-Fi down"); }
+    return;
+  }
+  if (mdnsStarted) return;
   mdnsStarted = MDNS.begin("watchcat-sensor");
   if (mdnsStarted) { MDNS.addService("http", "tcp", 80); Serial.println("mDNS: watchcat-sensor.local"); }
 }

@@ -6,6 +6,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <TJpg_Decoder.h>
+#include <ESPmDNS.h>
 #include "waiting_bitmap.h"
 #if __has_include("watchcat_config.h")
 #include "watchcat_config.h"
@@ -25,6 +26,9 @@
 #define WATCHCAT_SENSOR_LOCAL_URL "http://watchcat-sensor.local"
 #endif
 
+// The hostname the sensor advertises, without the .local suffix.
+#define WATCHCAT_SENSOR_MDNS_HOST "watchcat-sensor"
+
 namespace {
 // TFT wires: SCL -> GPIO13 (SCK), SDA -> GPIO14 (MOSI), CS=11, DC=10, RST=9.
 // Do not use global SPI here: Adafruit's init calls SPI.begin() again and
@@ -32,7 +36,7 @@ namespace {
 SPIClass tftSpi(HSPI);
 Adafruit_ST7789 tft(&tftSpi, 11, 10, 9);
 constexpr int kButtons[] = {5, 6, 7};
-constexpr uint32_t kDebounceMs = 40, kPollMs = 2000, kLivePollMs = 900, kButtonSampleMs = 10;
+constexpr uint32_t kDebounceMs = 40, kPollMs = 2000, kLivePollMs = 150, kButtonSampleMs = 10;
 uint32_t lastPoll = 0;
 // Presses are latched by a sampling task, not read from loop(). A status poll is a
 // blocking TLS request that can hold loop() for seconds, and the poll timer fires
@@ -40,6 +44,10 @@ uint32_t lastPoll = 0;
 // Debounce needs two samples of a held button, which meant only a multi-second hold
 // ever registered and an ordinary tap was dropped between polls.
 volatile bool pressLatched[] = {false, false, false};
+bool mdnsStarted = false;
+IPAddress sensorIp;
+uint32_t sensorIpAt = 0;
+constexpr uint32_t kSensorIpTtlMs = 60000;
 bool detail = false, liveView = false;
 // The waiting state is drawn from a Hangul bitmap, so it is matched by this marker
 // rather than printed as text. Every other title is ASCII and prints normally.
@@ -98,10 +106,38 @@ void poll() {
   title = stale ? kWaiting : boolIn(body, "catPresent", true) ? "CAT FOUND" : body.indexOf("\"inferenceState\":\"error\"") >= 0 ? "ERROR" : boolIn(body, "cameraOnline", true) ? "NO CAT" : "CAMERA OFFLINE";
   message = detail ? body.substring(0, 90) : "Pi status received"; draw();
 }
+// The sensor advertises watchcat-sensor.local over mDNS, but this board carried no
+// mDNS resolver, so the name fell through to the ISP's DNS — which answers NXDOMAIN
+// with an ad server. Live view was fetching from that server and handing its reply
+// to the JPEG decoder. Resolve over multicast and never query the .local name.
+// mDNS needs a live network interface, so this cannot run from setup().
+void ensureMdns() {
+  if (mdnsStarted || WiFi.status() != WL_CONNECTED) return;
+  mdnsStarted = MDNS.begin("watchcat-monitor");
+  Serial.println(mdnsStarted ? "mDNS resolver ready" : "mDNS resolver failed to start");
+}
+String sensorBase() {
+  const String configured = WATCHCAT_SENSOR_LOCAL_URL;
+  if (configured.indexOf(".local") < 0) return configured;  // explicit host, use as is
+  ensureMdns();
+  if (!mdnsStarted) return String();
+  if (sensorIp == IPAddress() || millis() - sensorIpAt >= kSensorIpTtlMs) {
+    const IPAddress found = MDNS.queryHost(WATCHCAT_SENSOR_MDNS_HOST, 2000);
+    if (found != IPAddress()) {
+      sensorIp = found; sensorIpAt = millis();
+      Serial.print("Sensor resolved over mDNS: "); Serial.println(sensorIp);
+    } else if (sensorIp == IPAddress()) {
+      Serial.println("Sensor mDNS lookup failed");
+    }
+  }
+  return sensorIp == IPAddress() ? String() : String("http://") + sensorIp.toString();
+}
 bool setLiveView(bool active) {
   if (!wifi()) return false;
+  const String base = sensorBase();
+  if (!base.length()) return false;
   HTTPClient http; WiFiClientSecure secureClient;
-  if (!beginGateway(http, secureClient, String(WATCHCAT_SENSOR_LOCAL_URL) + "/api/v1/live")) return false;
+  if (!beginGateway(http, secureClient, base + "/api/v1/live")) return false;
   http.addHeader("Content-Type", "application/json");
   if (strlen(WATCHCAT_CAMERA_TOKEN)) http.addHeader("Authorization", String("Bearer ") + WATCHCAT_CAMERA_TOKEN);
   const int code = http.POST(active ? "{\"active\":true}" : "{\"active\":false}"); http.end();
@@ -109,8 +145,10 @@ bool setLiveView(bool active) {
 }
 void showLiveFrame() {
   if (!wifi()) return;
+  const String base = sensorBase();
+  if (!base.length()) return;
   HTTPClient http; WiFiClientSecure secureClient;
-  const String endpoint = String(WATCHCAT_SENSOR_LOCAL_URL) + "/api/v1/live.jpg?t=" + String(millis());
+  const String endpoint = base + "/api/v1/live.jpg?t=" + String(millis());
   if (!beginGateway(http, secureClient, endpoint)) return;
   if (strlen(WATCHCAT_CAMERA_TOKEN)) http.addHeader("Authorization", String("Bearer ") + WATCHCAT_CAMERA_TOKEN);
   const int code = http.GET();
@@ -121,7 +159,11 @@ void showLiveFrame() {
   WiFiClient* stream = http.getStreamPtr();
   const size_t read = stream->readBytes(jpeg, size);
   http.end();
-  if (read == static_cast<size_t>(size)) {
+  // Only decode something that is actually a JPEG. Anything else on this endpoint —
+  // a captive portal, an ISP error page — used to be pushed straight to the decoder
+  // and painted as garbage.
+  const bool isJpeg = size >= 4 && jpeg[0] == 0xFF && jpeg[1] == 0xD8 && jpeg[2] == 0xFF;
+  if (read == static_cast<size_t>(size) && isJpeg) {
     tft.fillScreen(ST77XX_BLACK);
     TJpgDec.drawJpg(-20, 0, jpeg, size);
     tft.setTextColor(ST77XX_CYAN); tft.setTextSize(1); tft.setCursor(8, 8); tft.print("LIVE  B3 STOP");
