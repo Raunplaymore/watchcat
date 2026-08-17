@@ -44,10 +44,12 @@ enum Button : uint8_t { ButtonPrev, ButtonSelect, ButtonNext };
 enum Page : uint8_t { PageStatus, PagePhoto, PageLive, PageDetail, PageCount };
 
 constexpr uint32_t kDebounceMs = 40, kStatusPollMs = 2000, kLiveFrameMs = 150, kButtonSampleMs = 10;
-// A still is UXGA, far larger than a live frame, so it gets its own ceiling and is
-// decoded at 1/8 scale to fit the panel.
+// A still can be UXGA, far larger than a live frame, so it gets its own ceiling.
 constexpr int kMaxLiveBytes = 120000, kMaxPhotoBytes = 320000;
-constexpr int kPhotoScale = 8, kPhotoWidth = 1600 / kPhotoScale, kPhotoHeight = 1200 / kPhotoScale;
+// The panel's corners are rounded, so anything painted at the extreme edge is cut by
+// the bezel. Every page lays out inside this inset and a rounded border traces it, which
+// makes the curve read as part of the design instead of as clipping.
+constexpr int16_t kInset = 18, kPhotoTop = 78, kPhotoMaxHeight = 148;
 
 // Presses are latched by a sampling task, not read from loop(). A page action is a
 // blocking TLS request that can hold loop() for seconds, and the poll timer fires
@@ -133,19 +135,20 @@ const char* selectLabel(uint8_t p) {
 // the behaviour the way a fixed "B2 Page" caption did.
 void drawChrome(uint16_t color) {
   tft.setTextWrap(false);
-  tft.setTextColor(color); tft.setTextSize(2); tft.setCursor(12, 20); tft.print("WATCHCAT");
-  tft.drawFastHLine(12, 50, 216, color);
+  tft.drawRoundRect(6, 6, tft.width() - 12, tft.height() - 12, 14, 0x3186);  // dim gray
+  tft.setTextColor(color); tft.setTextSize(2); tft.setCursor(kInset, 20); tft.print("WATCHCAT");
+  tft.drawFastHLine(kInset, 46, tft.width() - 2 * kInset, color);
   tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE);
-  tft.setCursor(12, 252); tft.printf("< %s >", pageName(page));
-  tft.setCursor(12, 266); tft.printf("B2: %s", selectLabel(page));
+  tft.setCursor(kInset, 236); tft.printf("< %s >", pageName(page));
+  tft.setCursor(kInset, 250); tft.printf("B2: %s", selectLabel(page));
 }
 void drawStatusPage() {
   const uint16_t color = title == "CAT FOUND" ? ST77XX_RED : title == "NO CAT" ? ST77XX_GREEN : title == "ERROR" ? ST77XX_RED : ST77XX_YELLOW;
   tft.fillScreen(ST77XX_BLACK);
   drawChrome(color);
-  if (title == kWaiting) tft.drawBitmap(12, 82, kWaitingBitmap, kWaitingBitmapWidth, kWaitingBitmapHeight, color);
-  else { tft.setTextColor(color); tft.setTextSize(3); tft.setCursor(12, 85); tft.print(title); }
-  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1); tft.setTextWrap(true); tft.setCursor(12, 170); tft.print(message);
+  if (title == kWaiting) tft.drawBitmap((tft.width() - kWaitingBitmapWidth) / 2, 84, kWaitingBitmap, kWaitingBitmapWidth, kWaitingBitmapHeight, color);
+  else { tft.setTextColor(color); tft.setTextSize(3); tft.setCursor(kInset, 88); tft.print(title); }
+  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1); tft.setTextWrap(true); tft.setCursor(kInset, 166); tft.print(message);
 }
 void drawDetailPage() {
   tft.fillScreen(ST77XX_BLACK);
@@ -163,11 +166,11 @@ void drawDetailPage() {
     {"ERR",   orDash(jsonValue(statusBody, "lastError"))},
   };
   tft.setTextSize(1); tft.setTextWrap(false);
-  int y = 70;
+  int y = 62;
   for (const auto& row : rows) {
-    tft.setTextColor(ST77XX_CYAN); tft.setCursor(12, y); tft.print(row.label);
-    tft.setTextColor(ST77XX_WHITE); tft.setCursor(70, y); tft.print(row.value);
-    y += 14;
+    tft.setTextColor(ST77XX_CYAN); tft.setCursor(kInset, y); tft.print(row.label);
+    tft.setTextColor(ST77XX_WHITE); tft.setCursor(kInset + 54, y); tft.print(row.value);
+    y += 20;
   }
 }
 void render() {
@@ -266,22 +269,31 @@ size_t fetchJpeg(const String& endpoint, uint8_t** out, int maxBytes) {
 void drawPhotoPage() {
   tft.fillScreen(ST77XX_BLACK);
   drawChrome(ST77XX_YELLOW);
-  tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE); tft.setCursor(12, 70);
+  tft.setTextSize(1); tft.setTextColor(ST77XX_WHITE); tft.setCursor(kInset, kPhotoTop);
   if (!wifi()) { tft.print("Wi-Fi unavailable"); return; }
   tft.print("Loading...");
   uint8_t* jpeg = nullptr;
   const size_t bytes = fetchJpeg(String(WATCHCAT_MONITOR_BASE_URL) + "/api/v1/latest.jpg", &jpeg, kMaxPhotoBytes);
-  tft.fillRect(0, 60, tft.width(), 190, ST77XX_BLACK);
+  tft.fillRect(kInset - 4, 56, tft.width() - 2 * (kInset - 4), 176, ST77XX_BLACK);
   if (!bytes) {
-    tft.setCursor(12, 70); tft.print("No photo available");
+    tft.setCursor(kInset, kPhotoTop);
+    tft.printf("No photo (heap %lu)", static_cast<unsigned long>(ESP.getFreeHeap()));
     return;
   }
-  TJpgDec.setJpgScale(kPhotoScale);
-  TJpgDec.drawJpg((tft.width() - kPhotoWidth) / 2, 80, jpeg, bytes);
+  // The still is whatever the gateway last inferred, and that is not always UXGA — a
+  // stream frame can leave a QVGA image there. Fit to the panel from the actual size
+  // instead of assuming, or a live frame would be drawn at 40x30.
+  uint16_t jw = 0, jh = 0;
+  TJpgDec.getJpgSize(&jw, &jh, jpeg, bytes);
+  const int16_t availWidth = tft.width() - 2 * kInset;
+  int scale = 1;
+  while (scale < 8 && (jw / scale > availWidth || jh / scale > kPhotoMaxHeight)) scale *= 2;
+  TJpgDec.setJpgScale(scale);
+  TJpgDec.drawJpg(kInset + (availWidth - jw / scale) / 2, kPhotoTop, jpeg, bytes);
   TJpgDec.setJpgScale(1);
   free(jpeg);
-  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1); tft.setCursor(12, 236);
-  tft.printf("%s  %s", title == kWaiting ? "PENDING" : title.c_str(), orDash(jsonValue(statusBody, "confidence").substring(0, 5)).c_str());
+  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1); tft.setCursor(kInset, 232);
+  tft.printf("%ux%u 1/%d  %s", jw, jh, scale, title == kWaiting ? "PENDING" : title.c_str());
 }
 void showLiveFrame() {
   if (!wifi()) return;
