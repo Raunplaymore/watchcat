@@ -85,7 +85,11 @@ void poll() {
   if (strlen(WATCHCAT_CAMERA_TOKEN)) http.addHeader("Authorization", String("Bearer ") + WATCHCAT_CAMERA_TOKEN);
   const int code = http.GET(); const String body = code == 200 ? http.getString() : ""; http.end();
   if (code != 200) { title = "CAMERA OFFLINE"; message = "Gateway unavailable"; draw(); return; }
-  title = boolIn(body, "catPresent", true) ? "CAT FOUND" : body.indexOf("\"inferenceState\":\"waiting\"") >= 0 || body.indexOf("\"inferenceState\":\"running\"") >= 0 ? "INFERENCE WAITING" : body.indexOf("\"inferenceState\":\"error\"") >= 0 ? "ERROR" : boolIn(body, "cameraOnline", true) ? "NO CAT" : "CAMERA OFFLINE";
+  // A queued capture means the reported verdict still belongs to the previous photo:
+  // the sensor polls every 2s, so the gateway keeps serving the old completed result
+  // for seconds after B1. Showing it made a fresh capture look like an instant NO CAT.
+  const bool stale = boolIn(body, "capturePending", true) || body.indexOf("\"inferenceState\":\"waiting\"") >= 0 || body.indexOf("\"inferenceState\":\"running\"") >= 0;
+  title = stale ? "INFERENCE WAITING" : boolIn(body, "catPresent", true) ? "CAT FOUND" : body.indexOf("\"inferenceState\":\"error\"") >= 0 ? "ERROR" : boolIn(body, "cameraOnline", true) ? "NO CAT" : "CAMERA OFFLINE";
   message = detail ? body.substring(0, 90) : "Pi status received"; draw();
 }
 bool setLiveView(bool active) {
