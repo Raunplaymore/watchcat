@@ -51,7 +51,10 @@ constexpr int kMaxLiveBytes = 120000, kMaxPhotoBytes = 512000;
 // The panel's corners are rounded, so anything painted at the extreme edge is cut by
 // the bezel. Every page lays out inside this inset and a rounded border traces it, which
 // makes the curve read as part of the design instead of as clipping.
-constexpr int16_t kInset = 18, kPhotoTop = 78, kPhotoMaxHeight = 148;
+// A UXGA still lands at 200x150 (the decoder stops at 1/8), so the photo runs from
+// kPhotoTop to kPhotoTop+150 and its caption sits right under that — both must stay
+// clear of the navigator lines at y=236/250.
+constexpr int16_t kInset = 18, kPhotoTop = 64, kPhotoMaxHeight = 148;
 
 // Presses are latched by a sampling task, not read from loop(). A page action is a
 // blocking TLS request that can hold loop() for seconds. Debounce needs two samples
@@ -367,7 +370,7 @@ void drawPhotoPage() {
   TJpgDec.setJpgScale(1);
   free(jpeg);
   drawCatBoxes(imgX, kPhotoTop, jw / scale, jh / scale);
-  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1); tft.setCursor(kInset, 232);
+  tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1); tft.setCursor(kInset, 218);
   tft.printf("%ux%u 1/%d  %s", jw, jh, scale, title == kWaiting ? "PENDING" : title.c_str());
 }
 void showLiveFrame() {
