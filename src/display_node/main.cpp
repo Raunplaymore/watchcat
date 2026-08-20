@@ -45,7 +45,9 @@ enum Page : uint8_t { PageStatus, PagePhoto, PageLive, PageDetail, PageCount };
 
 constexpr uint32_t kDebounceMs = 40, kStatusPollMs = 2000, kLiveFrameMs = 150, kButtonSampleMs = 10;
 // A still can be UXGA, far larger than a live frame, so it gets its own ceiling.
-constexpr int kMaxLiveBytes = 120000, kMaxPhotoBytes = 320000;
+// The photo buffer lives in PSRAM; the sensor's driver cannot emit a JPEG past its
+// own 384 KB frame buffer, so anything larger than this is a bogus response.
+constexpr int kMaxLiveBytes = 120000, kMaxPhotoBytes = 512000;
 // The panel's corners are rounded, so anything painted at the extreme edge is cut by
 // the bezel. Every page lays out inside this inset and a rounded border traces it, which
 // makes the curve read as part of the design instead of as clipping.
@@ -359,7 +361,14 @@ void movePage(int delta) {
 }
 void selectOnPage() {
   switch (page) {
-    case PageStatus: capture(); render(); break;
+    case PageStatus:
+      // The capture POST blocks on a TLS handshake for seconds, and when the page
+      // already shows the waiting state the redraw after it looks identical — so
+      // acknowledge the press on screen before starting the request.
+      message = "Requesting...";
+      render();
+      capture(); render();
+      break;
     case PagePhoto: drawPhotoPage(); break;
     case PageLive:
       livePaused = !livePaused;
@@ -398,6 +407,7 @@ void setup() {
   Serial.begin(115200); delay(200);
   for (int pin : kButtons) pinMode(pin, INPUT_PULLUP);
   Serial.printf("Buttons ready: B1=prev(%d) B2=select(%d) B3=next(%d)\n", kButtons[0], kButtons[1], kButtons[2]);
+  Serial.printf("PSRAM: %u bytes\n", ESP.getPsramSize());
   xTaskCreate(buttonTask, "buttons", 2048, nullptr, 2, nullptr);
   tftSpi.begin(13, -1, 14, 11);
   tft.init(240, 280); tft.setRotation(2);
