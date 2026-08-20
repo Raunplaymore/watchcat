@@ -54,10 +54,9 @@ constexpr int kMaxLiveBytes = 120000, kMaxPhotoBytes = 512000;
 constexpr int16_t kInset = 18, kPhotoTop = 78, kPhotoMaxHeight = 148;
 
 // Presses are latched by a sampling task, not read from loop(). A page action is a
-// blocking TLS request that can hold loop() for seconds, and the poll timer fires
-// again the moment it returns, so loop() sampled the pins roughly once per poll.
-// Debounce needs two samples of a held button, which meant only a multi-second hold
-// ever registered and an ordinary tap was dropped between polls.
+// blocking TLS request that can hold loop() for seconds. Debounce needs two samples
+// of a held button, so sampling from loop() meant only a multi-second hold ever
+// registered and an ordinary tap was dropped.
 volatile bool pressLatched[] = {false, false, false};
 
 bool mdnsStarted = false;
@@ -66,7 +65,7 @@ uint32_t sensorIpAt = 0;
 constexpr uint32_t kSensorIpTtlMs = 60000;
 
 uint32_t liveFrames = 0, liveFetchMs = 0, liveDrawMs = 0, liveStatAt = 0;
-uint32_t lastStatusPoll = 0, lastLiveFrame = 0;
+uint32_t lastLiveFrame = 0;
 
 uint8_t page = PageStatus;
 bool livePaused = false;
@@ -75,6 +74,19 @@ String statusBody;  // last gateway status JSON, shared by the status and detail
 // rather than printed as text. Every other title is ASCII and prints normally.
 constexpr char kWaiting[] = "WAITING";
 String title = kWaiting, message = "Booting";
+
+// Status polling runs on its own task so a poll in flight never holds up loop()
+// and the buttons. The task hands results over through these staging copies under
+// the mutex; loop() copies them out and remains the sole owner of the
+// title/message/statusBody that the draw functions read — the TFT stays
+// single-task. pollMuteUntil discards results briefly after B2 requests a
+// capture: a poll already in flight predates the request, and letting it land
+// would flip the screen back to the previous verdict for one cycle.
+SemaphoreHandle_t statusMutex;
+String pendingTitle, pendingMessage, pendingBody;
+bool pendingBodyValid = false;
+volatile bool statusDirty = false;
+uint32_t pollMuteUntil = 0;
 
 bool wifi() {
   if (WiFi.status() == WL_CONNECTED) return true;
@@ -145,7 +157,8 @@ void drawChrome(uint16_t color) {
   tft.setCursor(kInset, 250); tft.printf("B2: %s", selectLabel(page));
 }
 void drawStatusPage() {
-  const uint16_t color = title == "CAT FOUND" ? ST77XX_RED : title == "NO CAT" ? ST77XX_GREEN : title == "ERROR" ? ST77XX_RED : ST77XX_YELLOW;
+  // Finding the cat is the good outcome, so it gets green; red is reserved for errors.
+  const uint16_t color = title == "CAT FOUND" ? ST77XX_GREEN : title == "NO CAT" ? ST77XX_WHITE : title == "ERROR" ? ST77XX_RED : ST77XX_YELLOW;
   tft.fillScreen(ST77XX_BLACK);
   drawChrome(color);
   if (title == kWaiting) tft.drawBitmap((tft.width() - kWaitingBitmapWidth) / 2, 84, kWaitingBitmap, kWaitingBitmapWidth, kWaitingBitmapHeight, color);
@@ -189,23 +202,58 @@ void capture() {
   const int code = http.POST("{}"); http.end();
   const bool ok = code >= 200 && code < 300;
   title = ok ? kWaiting : "ERROR"; message = ok ? "Capture requested" : "Capture request failed";
+  if (ok) pollMuteUntil = millis() + kStatusPollMs + 1500;
 }
-void pollStatus() {
-  if (!wifi()) { title = "CAMERA OFFLINE"; message = "Pi Wi-Fi unavailable"; return; }
+void commitStatus(const String& newTitle, const String& newMessage, const String* newBody) {
+  xSemaphoreTake(statusMutex, portMAX_DELAY);
+  pendingTitle = newTitle; pendingMessage = newMessage;
+  if (newBody) { pendingBody = *newBody; pendingBodyValid = true; }
+  statusDirty = true;
+  xSemaphoreGive(statusMutex);
+}
+// Polls the gateway over a single kept-alive TLS session. A fresh handshake per
+// poll held loop() for a second or more every cycle, which is where button taps
+// went to die — and bought nothing, since the session can simply stay open. The
+// Authorization header is added once per session: HTTPClient resends its stored
+// headers on every request, so adding it per poll would stack duplicates.
+void statusPollTask(void*) {
   HTTPClient http; WiFiClientSecure secureClient;
-  if (!beginGateway(http, secureClient, String(WATCHCAT_MONITOR_BASE_URL) + "/api/v1/status")) { title = "CAMERA OFFLINE"; message = "Gateway TLS unavailable"; return; }
-  if (strlen(WATCHCAT_CAMERA_TOKEN)) http.addHeader("Authorization", String("Bearer ") + WATCHCAT_CAMERA_TOKEN);
-  const int code = http.GET(); const String body = code == 200 ? http.getString() : ""; http.end();
-  if (code != 200) { title = "CAMERA OFFLINE"; message = "Gateway unavailable"; return; }
-  statusBody = body;
-  // A queued capture means the reported verdict still belongs to the previous photo:
-  // the sensor polls every 2s, so the gateway keeps serving the old completed result
-  // for seconds after a capture. Showing it made a fresh capture look like an instant
-  // NO CAT.
-  const bool stale = boolIn(body, "capturePending", true) || body.indexOf("\"inferenceState\":\"waiting\"") >= 0 || body.indexOf("\"inferenceState\":\"running\"") >= 0;
-  title = stale ? kWaiting : boolIn(body, "catPresent", true) ? "CAT FOUND" : body.indexOf("\"inferenceState\":\"error\"") >= 0 ? "ERROR" : boolIn(body, "cameraOnline", true) ? "NO CAT" : "CAMERA OFFLINE";
-  const String conf = jsonValue(body, "confidence");
-  message = stale ? "Waiting for the sensor" : conf.length() ? "confidence " + conf.substring(0, 5) : "Pi status received";
+  http.setReuse(true);
+  bool sessionUp = false;
+  for (;;) {
+    if (!wifi()) {
+      if (sessionUp) { http.end(); sessionUp = false; }
+      commitStatus("CAMERA OFFLINE", "Pi Wi-Fi unavailable", nullptr);
+    } else {
+      if (!sessionUp) {
+        sessionUp = beginGateway(http, secureClient, String(WATCHCAT_MONITOR_BASE_URL) + "/api/v1/status");
+        if (sessionUp && strlen(WATCHCAT_CAMERA_TOKEN)) http.addHeader("Authorization", String("Bearer ") + WATCHCAT_CAMERA_TOKEN);
+      }
+      if (!sessionUp) {
+        commitStatus("CAMERA OFFLINE", "Gateway TLS unavailable", nullptr);
+      } else {
+        const int code = http.GET();
+        const String body = code == 200 ? http.getString() : "";
+        if (code != 200) {
+          // The server may have quietly dropped the kept-alive connection; discard
+          // the session and let the next cycle handshake anew.
+          http.end(); sessionUp = false;
+          commitStatus("CAMERA OFFLINE", "Gateway unavailable", nullptr);
+        } else {
+          // A queued capture means the reported verdict still belongs to the previous
+          // photo: the sensor polls every 2s, so the gateway keeps serving the old
+          // completed result for seconds after a capture. Showing it made a fresh
+          // capture look like an instant NO CAT.
+          const bool stale = boolIn(body, "capturePending", true) || body.indexOf("\"inferenceState\":\"waiting\"") >= 0 || body.indexOf("\"inferenceState\":\"running\"") >= 0;
+          const String newTitle = stale ? kWaiting : boolIn(body, "catPresent", true) ? "CAT FOUND" : body.indexOf("\"inferenceState\":\"error\"") >= 0 ? "ERROR" : boolIn(body, "cameraOnline", true) ? "NO CAT" : "CAMERA OFFLINE";
+          const String conf = jsonValue(body, "confidence");
+          const String newMessage = stale ? String("Waiting for the sensor") : conf.length() ? "confidence " + conf.substring(0, 5) : String("Pi status received");
+          commitStatus(newTitle, newMessage, &body);
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(kStatusPollMs));
+  }
 }
 
 // The sensor advertises watchcat-sensor.local over mDNS, but this board carried no
@@ -268,6 +316,29 @@ size_t fetchJpeg(const String& endpoint, uint8_t** out, int maxBytes) {
   *out = buffer;
   return read;
 }
+// The gateway reports where inference found cats as normalized [x, y, w, h] in
+// "catBoxes":[[...],...]. Painted over the decoded photo; statusBody is loop-owned,
+// and boxes are cleared server-side while a capture is pending, so a stale photo
+// never wears a fresh verdict's rectangles.
+void drawCatBoxes(int16_t imgX, int16_t imgY, int16_t drawnW, int16_t drawnH) {
+  int cursor = statusBody.indexOf("\"catBoxes\":[");
+  if (cursor < 0) return;
+  cursor += 12;
+  for (;;) {
+    const int open = statusBody.indexOf('[', cursor);
+    const int stop = statusBody.indexOf(']', cursor);
+    if (open < 0 || (stop >= 0 && stop < open)) return;  // reached the array's own ]
+    const int close = statusBody.indexOf(']', open);
+    if (close < 0) return;
+    float x, y, w, h;
+    if (sscanf(statusBody.substring(open + 1, close).c_str(), "%f,%f,%f,%f", &x, &y, &w, &h) == 4) {
+      const int16_t bw = static_cast<int16_t>(w * drawnW), bh = static_cast<int16_t>(h * drawnH);
+      tft.drawRect(imgX + static_cast<int16_t>(x * drawnW), imgY + static_cast<int16_t>(y * drawnH),
+                   bw < 2 ? 2 : bw, bh < 2 ? 2 : bh, ST77XX_GREEN);
+    }
+    cursor = close + 1;
+  }
+}
 void drawPhotoPage() {
   tft.fillScreen(ST77XX_BLACK);
   drawChrome(ST77XX_YELLOW);
@@ -291,9 +362,11 @@ void drawPhotoPage() {
   int scale = 1;
   while (scale < 8 && (jw / scale > availWidth || jh / scale > kPhotoMaxHeight)) scale *= 2;
   TJpgDec.setJpgScale(scale);
-  TJpgDec.drawJpg(kInset + (availWidth - jw / scale) / 2, kPhotoTop, jpeg, bytes);
+  const int16_t imgX = kInset + (availWidth - jw / scale) / 2;
+  TJpgDec.drawJpg(imgX, kPhotoTop, jpeg, bytes);
   TJpgDec.setJpgScale(1);
   free(jpeg);
+  drawCatBoxes(imgX, kPhotoTop, jw / scale, jh / scale);
   tft.setTextColor(ST77XX_WHITE); tft.setTextSize(1); tft.setCursor(kInset, 232);
   tft.printf("%ux%u 1/%d  %s", jw, jh, scale, title == kWaiting ? "PENDING" : title.c_str());
 }
@@ -374,7 +447,9 @@ void selectOnPage() {
       livePaused = !livePaused;
       if (livePaused) drawLivePaused();
       break;
-    default: pollStatus(); render(); break;
+    // The poll task keeps the status at most one cycle old, so a refresh only
+    // needs to repaint from what is already here.
+    default: render(); break;
   }
 }
 
@@ -420,6 +495,10 @@ void setup() {
   // double swap, which decoded the geometry correctly but painted it in neon colors.
   TJpgDec.setJpgScale(1); TJpgDec.setSwapBytes(false); TJpgDec.setCallback(tftOutput);
   render(); wifi();
+  statusMutex = xSemaphoreCreateMutex();
+  // The poll task runs the TLS handshake; mbedTLS wants on the order of 10 KB of
+  // stack while it does, so this task gets far more than the button sampler.
+  xTaskCreate(statusPollTask, "status", 12288, nullptr, 1, nullptr);
 }
 void loop() {
   if (pressed(ButtonPrev)) movePage(-1);
@@ -427,12 +506,18 @@ void loop() {
   if (pressed(ButtonSelect)) selectOnPage();
   if (page == PageLive) {
     if (!livePaused && millis() - lastLiveFrame >= kLiveFrameMs) { lastLiveFrame = millis(); showLiveFrame(); }
-  } else if (millis() - lastStatusPoll >= kStatusPollMs) {
-    lastStatusPoll = millis();
-    pollStatus();
+  } else if (statusDirty) {
+    xSemaphoreTake(statusMutex, portMAX_DELAY);
+    const bool muted = millis() < pollMuteUntil;
+    if (!muted) {
+      title = pendingTitle; message = pendingMessage;
+      if (pendingBodyValid) { statusBody = pendingBody; pendingBodyValid = false; }
+    }
+    statusDirty = false;
+    xSemaphoreGive(statusMutex);
     // Only the pages that show status text need repainting on a poll. Redrawing the
     // photo page here would refetch a UXGA still every two seconds.
-    if (page == PageStatus || page == PageDetail) render();
+    if (!muted && (page == PageStatus || page == PageDetail)) render();
   }
   delay(5);
 }
