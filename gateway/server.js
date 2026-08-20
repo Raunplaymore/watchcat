@@ -12,7 +12,7 @@ const MAX_FRAME_BYTES = Number(process.env.WATCHCAT_MAX_FRAME_BYTES || 2 * 1024 
 let inferenceTail = Promise.resolve();
 // latestFilename/capturedAt describe the last inferred still. Live-stream frames
 // are tracked separately so a live frame never gets served next to a stale verdict.
-let state = { cameraOnline: false, inferenceState: 'idle', catPresent: false, confidence: null, capturedAt: null, processedAt: null, lastError: null, latestFilename: null, requestId: null, liveFilename: null, liveAt: null };
+let state = { cameraOnline: false, inferenceState: 'idle', catPresent: false, confidence: null, catBoxes: [], capturedAt: null, processedAt: null, lastError: null, latestFilename: null, requestId: null, liveFilename: null, liveAt: null };
 let captureCommand = null;
 let streamCommand = null;
 let streamActive = false;
@@ -41,7 +41,7 @@ async function post(url, value, headers) {
   return result;
 }
 function queue(job) {
-  state = { ...state, cameraOnline: true, inferenceState: 'waiting', catPresent: false, confidence: null, lastError: null, latestFilename: job.filename, capturedAt: job.capturedAt, requestId: job.id };
+  state = { ...state, cameraOnline: true, inferenceState: 'waiting', catPresent: false, confidence: null, catBoxes: [], lastError: null, latestFilename: job.filename, capturedAt: job.capturedAt, requestId: job.id };
   const run = inferenceTail.then(() => infer(job), () => infer(job)); inferenceTail = run.catch(() => {});
 }
 async function infer(job) {
@@ -52,8 +52,12 @@ async function infer(job) {
     const meta = await response.json().catch(() => ({})); if (!response.ok) throw new Error(meta.error || `Metadata HTTP ${response.status}`);
     const cats = (meta.frames || []).flatMap(frame => frame.detections || []).filter(item => item.label === 'cat');
     const confidence = cats.reduce((best, item) => Math.max(best, Number(item.conf) || 0), 0);
-    state = { ...state, inferenceState: 'complete', catPresent: cats.length > 0, confidence: cats.length ? confidence : null, processedAt: new Date().toISOString(), lastError: null };
-  } catch (error) { state = { ...state, inferenceState: 'error', catPresent: false, confidence: null, processedAt: new Date().toISOString(), lastError: error.message }; }
+    // Boxes ride along normalized [x, y, w, h] so the monitor can paint them over
+    // the photo. Rounded to 3 decimals — the monitor parses this JSON by hand and
+    // full doubles would only bloat what it has to scan.
+    const catBoxes = cats.slice(0, 4).map(item => Array.isArray(item.bbox) && item.bbox.length === 4 ? item.bbox.map(value => Math.round(Number(value) * 1000) / 1000) : null).filter(Boolean);
+    state = { ...state, inferenceState: 'complete', catPresent: cats.length > 0, confidence: cats.length ? confidence : null, catBoxes, processedAt: new Date().toISOString(), lastError: null };
+  } catch (error) { state = { ...state, inferenceState: 'error', catPresent: false, confidence: null, catBoxes: [], processedAt: new Date().toISOString(), lastError: error.message }; }
 }
 async function frame(req, res) {
   if (!authorized(req)) return json(res, 401, { ok: false, error: 'Unauthorized' });
