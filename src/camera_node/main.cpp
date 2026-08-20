@@ -26,6 +26,10 @@ camera_config_t kCamera = {
   .pin_d7=48, .pin_d6=11, .pin_d5=12, .pin_d4=14, .pin_d3=16, .pin_d2=18,
   .pin_d1=17, .pin_d0=15, .pin_vsync=38, .pin_href=47, .pin_pclk=13,
   .xclk_freq_hz=20000000, .ledc_timer=LEDC_TIMER_0, .ledc_channel=LEDC_CHANNEL_0,
+  // The driver sizes the JPEG frame buffer as width*height/5 (384 KB at UXGA)
+  // regardless of quality, and drops any frame that overflows it. Quality 2 was
+  // measured to exceed that once AEC brightens the scene — every still failed
+  // at esp_camera_fb_get() — so 4 (~200 KB) is the practical ceiling here.
   .pixel_format=PIXFORMAT_JPEG, .frame_size=FRAMESIZE_UXGA, .jpeg_quality=4,
   .fb_count=2, .fb_location=CAMERA_FB_IN_PSRAM, .grab_mode=CAMERA_GRAB_LATEST,
 };
@@ -91,12 +95,18 @@ void tuneSensor(sensor_t* sensor) {
   tune("wb_mode", sensor->set_wb_mode(sensor, 4));  // 4 = home/indoor preset
   tune("exposure_ctrl", sensor->set_exposure_ctrl(sensor, 1));
   tune("aec2", sensor->set_aec2(sensor, 1));
-  // ae_level 2 / GAINCEILING_32X was measured to change nothing here (luminance
-  // stayed at 39/255) and coincided with a truncated 41 KB UXGA frame, so the
-  // ceiling stays at 16X. Brightening this scene needs tone mapping, not gain.
-  tune("ae_level", sensor->set_ae_level(sensor, 1));
+  // ae_level 1 and brightness 2 were compensation for the broken gain ceiling
+  // below; once AEC could actually raise gain they stacked into overexposure
+  // (mean 192/255), so both sit at neutral now.
+  tune("ae_level", sensor->set_ae_level(sensor, 0));
   tune("gain_ctrl", sensor->set_gain_ctrl(sensor, 1));
-  tune("gainceiling", sensor->set_gainceiling(sensor, GAINCEILING_16X));
+  // The driver's set_gainceiling() writes its enum ordinal (0-6) straight into
+  // 0x3A18/19, but those registers hold the AEC gain ceiling in 1/16-gain
+  // units — every enum lands below the 1x minimum, so AEC could never raise
+  // gain and dark frames stayed dark (why ae_level/gainceiling measured as
+  // no-ops). Restore the sensor-default ceiling of 15.5x (0x0F8) directly.
+  tune("gainceiling_hi", sensor->set_reg(sensor, 0x3A18, 0x03, 0x00));
+  tune("gainceiling_lo", sensor->set_reg(sensor, 0x3A19, 0xFF, 0xF8));
   // Tone and correction stages the driver leaves off. Correcting this camera's
   // cast and flat midtones in post was what lifted a cat from undetected to
   // conf 0.274 on the same frame, so the same work belongs in the sensor: gamma
@@ -106,7 +116,7 @@ void tuneSensor(sensor_t* sensor) {
   tune("lenc", sensor->set_lenc(sensor, 1));
   tune("bpc", sensor->set_bpc(sensor, 1));
   tune("wpc", sensor->set_wpc(sensor, 1));
-  tune("brightness", sensor->set_brightness(sensor, 2));
+  tune("brightness", sensor->set_brightness(sensor, 0));
   tune("contrast", sensor->set_contrast(sensor, 2));
   tune("saturation", sensor->set_saturation(sensor, 1));
   tune("sharpness", sensor->set_sharpness(sensor, 2));
