@@ -114,10 +114,7 @@ function draw(targets,online){
  g.strokeStyle='#233049';g.beginPath();g.moveTo(cx,cy);g.lineTo(cx,cy-maxR*sc);g.stroke();
  const now=Date.now();
  for(const p of trails){const age=(now-p.t)/10000;if(age>1)continue;g.fillStyle='rgba(94,232,127,'+(0.45*(1-age)).toFixed(3)+')';g.beginPath();g.arc(cx+p.x*sc,cy-p.y*sc,3,0,7);g.fill()}
- // Bubble is drawn at 5x the measured spread: real spreads run only a few cm
- // (the radar's internal tracker smooths most wander), too small to see at map
- // scale. The ±cm label stays the true value.
- blobs.forEach((b,i)=>{const px=cx+b.x*sc,py=cy-b.y*sc,sp=spreadOf(b.hist),rr=Math.max(sp*5*sc,10);
+ blobs.forEach((b,i)=>{const px=cx+b.x*sc,py=cy-b.y*sc,sp=spreadOf(b.hist),rr=Math.max(sp*sc,10);
   g.fillStyle='rgba(94,232,127,0.14)';g.strokeStyle='rgba(94,232,127,0.4)';g.beginPath();g.arc(px,py,rr,0,7);g.fill();g.stroke();
   g.fillStyle=colors[i%3];g.beginPath();g.arc(px,py,7,0,7);g.fill();
   g.fillStyle='#dde';g.fillText((b.y/1000).toFixed(2)+'m · '+Math.round(b.speed/10)+'cm/s'+(sp?' · ±'+Math.round(sp/10)+'cm':''),px+10,py-8)});
