@@ -142,6 +142,11 @@ const radar = require('./radar')({ authorized });
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   if (url.pathname.startsWith('/api/v1/radar/')) return radar.handle(req, res, url);
+  // The radar map lives at its own hostname (radar.*) and at /radar on any host.
+  if (req.method === 'GET' && (url.pathname === '/radar' || (url.pathname === '/' && String(req.headers.host || '').startsWith('radar.')))) {
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    return res.end(radar.page);
+  }
   if (req.method === 'GET' && url.pathname === '/') { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); return res.end(page); }
   if (req.method === 'GET' && url.pathname === '/api/v1/status') return json(res, 200, { ok: true, ...state, capturePending: Boolean(captureCommand), streamPending: Boolean(streamCommand), streamActive });
   if (req.method === 'GET' && url.pathname === '/api/v1/latest.jpg') return serveJpeg(res, state.latestFilename);

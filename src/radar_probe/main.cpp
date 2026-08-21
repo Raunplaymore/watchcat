@@ -18,6 +18,14 @@ HardwareSerial radar(1);
 void setup() {
   Serial.begin(115200);
   delay(2000);  // the USB CDC console needs a moment to enumerate before the first lines
+  // A UART line idles high, so with a pulldown a connected-and-powered radar TX
+  // reads ~100/100 high; a broken wire or unpowered module reads ~0. Sampled
+  // before the UART claims the pin.
+  pinMode(kRadarRx, INPUT_PULLDOWN);
+  delay(50);
+  int idleHigh = 0;
+  for (int i = 0; i < 100; i++) { idleHigh += digitalRead(kRadarRx); delayMicroseconds(200); }
+  Serial.printf("RX line: %d/100 high\n", idleHigh);
   radar.begin(kRadarBaud, SERIAL_8N1, kRadarRx, kRadarTx);
   Serial.printf("LD2454 probe: RX=GPIO%d TX=GPIO%d baud=%lu\n", kRadarRx, kRadarTx, static_cast<unsigned long>(kRadarBaud));
 }
