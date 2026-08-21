@@ -12,7 +12,7 @@ const MAX_FRAME_BYTES = Number(process.env.WATCHCAT_MAX_FRAME_BYTES || 2 * 1024 
 let inferenceTail = Promise.resolve();
 // latestFilename/capturedAt describe the last inferred still. Live-stream frames
 // are tracked separately so a live frame never gets served next to a stale verdict.
-let state = { cameraOnline: false, inferenceState: 'idle', catPresent: false, confidence: null, catBoxes: [], capturedAt: null, processedAt: null, lastError: null, latestFilename: null, requestId: null, liveFilename: null, liveAt: null };
+let state = { cameraOnline: false, inferenceState: 'idle', catPresent: false, confidence: null, catBoxes: [], capturedAt: null, processedAt: null, lastCatAt: null, lastError: null, latestFilename: null, requestId: null, liveFilename: null, liveAt: null };
 let captureCommand = null;
 let streamCommand = null;
 let streamActive = false;
@@ -56,7 +56,7 @@ async function infer(job) {
     // the photo. Rounded to 3 decimals — the monitor parses this JSON by hand and
     // full doubles would only bloat what it has to scan.
     const catBoxes = cats.slice(0, 4).map(item => Array.isArray(item.bbox) && item.bbox.length === 4 ? item.bbox.map(value => Math.round(Number(value) * 1000) / 1000) : null).filter(Boolean);
-    state = { ...state, inferenceState: 'complete', catPresent: cats.length > 0, confidence: cats.length ? confidence : null, catBoxes, processedAt: new Date().toISOString(), lastError: null };
+    state = { ...state, inferenceState: 'complete', catPresent: cats.length > 0, confidence: cats.length ? confidence : null, catBoxes, processedAt: new Date().toISOString(), lastCatAt: cats.length ? new Date().toISOString() : state.lastCatAt, lastError: null };
   } catch (error) { state = { ...state, inferenceState: 'error', catPresent: false, confidence: null, catBoxes: [], processedAt: new Date().toISOString(), lastError: error.message }; }
 }
 async function frame(req, res) {
@@ -137,20 +137,19 @@ async function serveJpeg(res, filename) {
     return stream.pipe(res);
   } catch (error) { await handle.close(); return json(res, 500, { ok: false, error: error.message }); }
 }
-const page = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>watchcat camera</title><style>body{margin:0;background:#0b0e13;color:#dde;font:15px system-ui}main{max-width:720px;margin:auto;padding:1.2rem}h1{margin:.2rem 0 .8rem;letter-spacing:.06em;font-size:1.3rem}h1 a{color:#5a6a85;text-decoration:none;font-size:.75rem;float:right;margin-top:.4rem}strong{font-size:1.8rem}p{margin:.4rem 0;color:#9ab}img{max-width:100%;margin-top:.8rem;background:#0d1118;border-radius:12px}button{background:#1c2330;color:#dde;border:1px solid #334;border-radius:10px;padding:.55rem 1.1rem;margin:.5rem .5rem 0 0;font-size:.95rem}button:active{background:#2c4a66}.error{color:#f66}#rd{color:#9ab8dd}</style><main><h1>📷 WATCHCAT CAMERA <a href="/">홈</a></h1><strong id=r>Loading…</strong><p id=d></p><p id=rd></p><button id=b>사진 촬영</button><button id=l>라이브 시작</button><img id=i alt="최근 사진"><script>const r=document.querySelector('#r'),d=document.querySelector('#d'),rd=document.querySelector('#rd'),i=document.querySelector('#i'),b=document.querySelector('#b'),l=document.querySelector('#l');let on=false,timer=0;async function x(){clearTimeout(timer);try{let s=await fetch('/api/v1/status').then(v=>v.json());on=Boolean(s.streamActive);const v=on&&s.liveFilename;const pend=s.capturePending||s.inferenceState==='waiting'||s.inferenceState==='running';l.textContent=s.streamPending?'대기 중…':on?'라이브 정지':'라이브 시작';r.textContent=v?'LIVE':pend?'오월이 어딧나...?':s.catPresent?'CAT FOUND':'NO CAT';d.textContent=v?'live preview · '+(s.liveAt??'-'):pend?'촬영 대기 중…':s.lastError||'confidence: '+(s.confidence??'-')+' · '+(s.processedAt??'-');d.className=!v&&s.lastError?'error':'';if(v)i.src='/api/v1/live.jpg?t='+Date.now();else if(s.latestFilename)i.src='/api/v1/latest.jpg?t='+Date.now();try{const q=await fetch('/api/v1/radar/status').then(v=>v.json());const t=q.targets&&q.targets[0];rd.textContent=q.sensorOnline?(q.radarOk?'레이더 온라인 · 타겟 '+q.targets.length+(t?' · x '+t.xMm+' y '+t.yMm+' mm · '+Math.round(t.speedMmPerSec/10)+' cm/s':''):'레이더 노드 온라인 · 레이더 무신호'):'레이더 오프라인'}catch(e){rd.textContent=''}}catch(e){r.textContent='GATEWAY ERROR';d.textContent=e.message}timer=setTimeout(x,on?700:2000)}b.onclick=()=>fetch('/api/v1/capture',{method:'POST'}).then(x);l.onclick=()=>fetch('/api/v1/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:!on})}).then(x);x();</script></main>`;
+const page = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>watchcat camera</title><style>body{margin:0;background:#0b0e13;color:#dde;font:15px system-ui}main{max-width:720px;margin:auto;padding:1.2rem}h1{margin:.2rem 0 .8rem;letter-spacing:.06em;font-size:1.3rem}h1 a{color:#5a6a85;text-decoration:none;font-size:.75rem;float:right;margin-top:.4rem}strong{font-size:1.8rem}p{margin:.4rem 0;color:#9ab}img{max-width:100%;margin-top:.8rem;background:#0d1118;border-radius:12px}button{background:#1c2330;color:#dde;border:1px solid #334;border-radius:10px;padding:.55rem 1.1rem;margin:.5rem .5rem 0 0;font-size:.95rem}button:active{background:#2c4a66}.error{color:#f66}#rd{color:#9ab8dd}</style><main><h1>📷 WATCHCAT CAMERA <a href="https://watchcat.linkus-plz.com/">홈</a></h1><strong id=r>Loading…</strong><p id=d></p><p id=rd></p><button id=b>사진 촬영</button><button id=l>라이브 시작</button><img id=i alt="최근 사진"><script>const r=document.querySelector('#r'),d=document.querySelector('#d'),rd=document.querySelector('#rd'),i=document.querySelector('#i'),b=document.querySelector('#b'),l=document.querySelector('#l');let on=false,timer=0;async function x(){clearTimeout(timer);try{let s=await fetch('/api/v1/status').then(v=>v.json());on=Boolean(s.streamActive);const v=on&&s.liveFilename;const pend=s.capturePending||s.inferenceState==='waiting'||s.inferenceState==='running';l.textContent=s.streamPending?'대기 중…':on?'라이브 정지':'라이브 시작';r.textContent=v?'LIVE':pend?'오월이 어딧나...?':s.catPresent?'CAT FOUND':'NO CAT';d.textContent=v?'live preview · '+(s.liveAt??'-'):pend?'촬영 대기 중…':s.lastError||'confidence: '+(s.confidence??'-')+' · '+(s.processedAt??'-');d.className=!v&&s.lastError?'error':'';if(v)i.src='/api/v1/live.jpg?t='+Date.now();else if(s.latestFilename)i.src='/api/v1/latest.jpg?t='+Date.now();try{const q=await fetch('/api/v1/radar/status').then(v=>v.json());const t=q.targets&&q.targets[0];rd.textContent=q.sensorOnline?(q.radarOk?'레이더 온라인 · 타겟 '+q.targets.length+(t?' · x '+t.xMm+' y '+t.yMm+' mm · '+Math.round(t.speedMmPerSec/10)+' cm/s':''):'레이더 노드 온라인 · 레이더 무신호'):'레이더 오프라인'}catch(e){rd.textContent=''}}catch(e){r.textContent='GATEWAY ERROR';d.textContent=e.message}timer=setTimeout(x,on?700:2000)}b.onclick=()=>fetch('/api/v1/capture',{method:'POST'}).then(x);l.onclick=()=>fetch('/api/v1/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:!on})}).then(x);x();</script></main>`;
 const radar = require('./radar')({ authorized });
 // The hub at watchcat.* fronts both projects: one glance-summary card each,
 // clicking through to the 1-depth pages /camera and /radar.
-const hubPage = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>watchcat</title><style>body{margin:0;background:#0b0e13;color:#dde;font:15px system-ui}main{max-width:720px;margin:auto;padding:1.2rem}h1{margin:.2rem 0 .1rem;letter-spacing:.06em}#tg{color:#8ab;margin:0 0 1rem}a.card{display:block;background:#141a26;border:1px solid #26314a;border-radius:14px;padding:1rem 1.1rem;margin-bottom:1rem;text-decoration:none;color:#dde}a.card:active{background:#1a2233}h2{margin:0 0 .4rem;font-size:1.05rem;color:#9ab8dd}strong{font-size:1.5rem}p{margin:.3rem 0 0;color:#9ab}img{width:100%;margin-top:.7rem;border-radius:10px;background:#0d1118}.on{color:#5ee87f}.warn{color:#e8b45e}.off{color:#f66}#go{color:#5a6a85;font-size:.85rem;float:right;margin-top:.2rem}</style><main><h1>WATCHCAT</h1><p id=tg>오월이 관측 시스템</p><a class=card href="/camera"><span id=go>카메라 →</span><h2>📷 카메라 · Hailo 판정</h2><strong id=cs>…</strong><p id=cd></p><img id=ci alt="최근 사진"></a><a class=card href="/radar"><span id=go2 style="color:#5a6a85;font-size:.85rem;float:right;margin-top:.2rem">레이더 →</span><h2>📡 레이더 · 위치 추적</h2><strong id=rs>…</strong><p id=rd3></p></a></main><script>
-const cs=document.getElementById('cs'),cd=document.getElementById('cd'),ci=document.getElementById('ci'),rs=document.getElementById('rs'),rd3=document.getElementById('rd3');
+const hubPage = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>watchcat</title><style>body{margin:0;background:#0b0e13;color:#dde;font:15px system-ui}main{max-width:720px;margin:auto;padding:1.2rem}h1{margin:.2rem 0 .1rem;letter-spacing:.06em}#tg{color:#8ab;margin:0 0 1rem}a.card{display:block;background:#141a26;border:1px solid #26314a;border-radius:14px;padding:1rem 1.1rem;margin-bottom:1rem;text-decoration:none;color:#dde}a.card:active{background:#1a2233}h2{margin:0 0 .4rem;font-size:1.05rem;color:#9ab8dd}strong{font-size:1.5rem}p{margin:.3rem 0 0;color:#9ab}img{width:100%;margin-top:.7rem;border-radius:10px;background:#0d1118}.on{color:#5ee87f}.warn{color:#e8b45e}.off{color:#f66}#go{color:#5a6a85;font-size:.85rem;float:right;margin-top:.2rem}</style><main><h1>WATCHCAT</h1><p id=tg>오월이 관측 시스템</p><a class=card href="/camera"><span id=go>카메라 →</span><h2>📷 카메라 · Hailo 판정</h2><strong id=cs>…</strong><p id=cd></p></a><a class=card href="/radar"><span id=go2 style="color:#5a6a85;font-size:.85rem;float:right;margin-top:.2rem">레이더 →</span><h2>📡 레이더 · 위치 추적</h2><strong id=rs>…</strong><p id=rd3></p></a></main><script>
+const cs=document.getElementById('cs'),cd=document.getElementById('cd'),rs=document.getElementById('rs'),rd3=document.getElementById('rd3');
 let timer=0;
 async function tick(){clearTimeout(timer);
  try{const s=await fetch('/api/v1/status').then(v=>v.json());
   const pend=s.capturePending||s.inferenceState==='waiting'||s.inferenceState==='running';
   cs.textContent=pend?'판정 중…':s.catPresent?'CAT FOUND':s.inferenceState==='error'?'ERROR':s.cameraOnline?'NO CAT':'대기';
   cs.className=s.catPresent?'on':'';
-  cd.textContent=pend?'촬영 대기 중':(s.confidence?'confidence '+String(s.confidence).slice(0,5)+' · ':'')+(s.processedAt?new Date(s.processedAt).toLocaleTimeString():'기록 없음');
-  if(s.latestFilename)ci.src='/api/v1/latest.jpg?t='+Math.floor(Date.now()/30000);
+  cd.textContent=s.lastCatAt?'마지막 발견 '+new Date(s.lastCatAt).toLocaleString('ko-KR',{month:'numeric',day:'numeric',hour:'numeric',minute:'2-digit'}):'발견 기록 없음';
  }catch(e){cs.textContent='게이트웨이 오류';cs.className='off'}
  try{const q=await fetch('/api/v1/radar/status').then(v=>v.json());
   const t=q.targets&&q.targets[0];
@@ -161,6 +160,22 @@ async function tick(){clearTimeout(timer);
  timer=setTimeout(tick,2000)}
 tick();
 </script>`;
+// A restart used to blank the photo on every page until the next capture: the
+// latest filename lived only in memory while the stills sit on disk. Restore
+// the newest still at startup — its verdict is unknown, so only the filename
+// comes back, never a stale catPresent.
+async function seedLatestPhoto() {
+  try {
+    const files = (await fsp.readdir(UPLOAD_DIR)).filter(f => f.startsWith('watchcat_') && f.endsWith('.jpg') && f !== 'watchcat_live.jpg');
+    let best = null, bestMtime = 0;
+    for (const f of files) {
+      const { mtimeMs } = await fsp.stat(path.join(UPLOAD_DIR, f));
+      if (mtimeMs > bestMtime) { bestMtime = mtimeMs; best = f; }
+    }
+    if (best) state = { ...state, latestFilename: best };
+  } catch {}
+}
+seedLatestPhoto();
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   if (url.pathname.startsWith('/api/v1/radar/')) return radar.handle(req, res, url);
