@@ -16,3 +16,10 @@
 // Local-only live view for the administrator monitor. The sensor advertises
 // this name with mDNS, so it does not require a fixed LAN IP address.
 #define WATCHCAT_SENSOR_LOCAL_URL "http://watchcat-sensor.local"
+
+// Optional radar node overrides. Defaults: the gateway URL/CA above and the
+// sensor id "living-room-radar-1". The id must be on the gateway's
+// WATCHCAT_RADAR_SENSORS allowlist when that variable is set.
+// #define WATCHCAT_RADAR_SENSOR_ID "living-room-radar-1"
+// #define WATCHCAT_RADAR_BASE_URL WATCHCAT_GATEWAY_BASE_URL
+// #define WATCHCAT_RADAR_TLS_CA_CERT WATCHCAT_GATEWAY_TLS_CA_CERT
