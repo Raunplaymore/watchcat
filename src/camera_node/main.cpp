@@ -46,7 +46,7 @@ uint32_t lastCommandPollAt = 0;
 int lastWifiStatus = WL_NO_SHIELD;
 constexpr uint32_t kWifiRetryMs = 15000;
 constexpr uint32_t kCommandPollMs = 2000;
-constexpr uint32_t kStreamFrameMs = 700;
+constexpr uint32_t kStreamFrameMs = 200;
 bool remoteStreaming = false;
 bool directLive = false;
 uint32_t lastStreamFrameAt = 0;
@@ -178,7 +178,7 @@ void noteGrabFailure() {
   delay(100);
   esp_restart();
 }
-bool upload(const String& commandId = "", bool isStreaming = false) {
+bool upload(const String& commandId = "") {
   if (!cameraReady) { lastError = "Camera not ready"; return false; }
   if (!wifi()) { lastError = "Wi-Fi unavailable"; return false; }
   camera_fb_t* frame = esp_camera_fb_get();
@@ -192,12 +192,45 @@ bool upload(const String& commandId = "", bool isStreaming = false) {
   http.addHeader("X-Watchcat-Camera-Id", "xiao-esp32s3-sense");
   http.addHeader("X-Watchcat-Captured-At", String(millis()));
   http.addHeader("X-Watchcat-Width", String(frame->width)); http.addHeader("X-Watchcat-Height", String(frame->height));
-  if (isStreaming) http.addHeader("X-Watchcat-Stream", "true");
   if (commandId.length()) http.addHeader("X-Watchcat-Command-Id", commandId);
   if (strlen(WATCHCAT_CAMERA_TOKEN)) http.addHeader("Authorization", String("Bearer ") + WATCHCAT_CAMERA_TOKEN);
   const int code = http.POST(frame->buf, frame->len);
   esp_camera_fb_return(frame); http.end();
   if (code < 200 || code >= 300) { lastError = "Upload HTTP " + String(code); return false; }
+  lastCaptureAt = String(millis()); lastError = ""; return true;
+}
+// Live frames ride one kept-alive TLS session: a handshake per frame capped the
+// stream at ~0.3 fps regardless of the frame interval (the same lesson as the
+// monitor's status poller and the radar node). Only constant headers are needed
+// here — the gateway stamps arrival time itself and ignores geometry for live
+// frames — so the session's stored headers stay valid across posts. Stills keep
+// their own per-request client: they are rare and carry per-shot headers.
+HTTPClient liveHttp;
+WiFiClientSecure liveSecureClient;
+bool liveSessionUp = false;
+bool uploadLiveFrame() {
+  if (!cameraReady || !wifi()) return false;
+  if (!liveSessionUp) {
+    if (!beginGateway(liveHttp, liveSecureClient, String(WATCHCAT_CAMERA_UPLOAD_BASE_URL) + "/api/v1/frames")) return false;
+    liveHttp.setReuse(true);
+    liveHttp.addHeader("Content-Type", "image/jpeg");
+    liveHttp.addHeader("X-Watchcat-Camera-Id", "xiao-esp32s3-sense");
+    liveHttp.addHeader("X-Watchcat-Stream", "true");
+    if (strlen(WATCHCAT_CAMERA_TOKEN)) liveHttp.addHeader("Authorization", String("Bearer ") + WATCHCAT_CAMERA_TOKEN);
+    liveSessionUp = true;
+  }
+  camera_fb_t* frame = esp_camera_fb_get();
+  if (!frame) { lastError = "Capture failed"; noteGrabFailure(); return false; }
+  consecutiveGrabFailures = 0;
+  const int code = liveHttp.POST(frame->buf, frame->len);
+  esp_camera_fb_return(frame);
+  if (code < 200 || code >= 300) {
+    // The server may have quietly dropped the kept-alive connection; discard the
+    // session and let the next frame handshake anew.
+    liveHttp.end(); liveSessionUp = false;
+    lastError = "Live upload HTTP " + String(code);
+    return false;
+  }
   lastCaptureAt = String(millis()); lastError = ""; return true;
 }
 // A still headed for inference is always full resolution, even mid-live-view:
@@ -235,16 +268,23 @@ void setRemoteStreaming(bool active) {
   lastStreamFrameAt = 0;
   Serial.println(active ? "Remote live stream started" : "Remote live stream stopped");
 }
+// Command polling also rides one kept-alive TLS session: a fresh handshake
+// every 2 s poll was stealing most of loop()'s time, which capped the live
+// stream far below its frame interval no matter how fast frames were sent.
+HTTPClient cmdHttp;
+WiFiClientSecure cmdSecureClient;
+bool cmdSessionUp = false;
 void pollCommand() {
   if (!cameraReady || !wifi()) return;
-  HTTPClient http;
-  WiFiClientSecure secureClient;
-  if (!beginGateway(http, secureClient, String(WATCHCAT_CAMERA_UPLOAD_BASE_URL) + "/api/v1/commands/next")) return;
-  if (strlen(WATCHCAT_CAMERA_TOKEN)) http.addHeader("Authorization", String("Bearer ") + WATCHCAT_CAMERA_TOKEN);
-  const int code = http.GET();
-  const String response = code == 200 ? http.getString() : "";
-  http.end();
-  if (code != 200) { lastError = "Command HTTP " + String(code); return; }
+  if (!cmdSessionUp) {
+    if (!beginGateway(cmdHttp, cmdSecureClient, String(WATCHCAT_CAMERA_UPLOAD_BASE_URL) + "/api/v1/commands/next")) return;
+    cmdHttp.setReuse(true);
+    if (strlen(WATCHCAT_CAMERA_TOKEN)) cmdHttp.addHeader("Authorization", String("Bearer ") + WATCHCAT_CAMERA_TOKEN);
+    cmdSessionUp = true;
+  }
+  const int code = cmdHttp.GET();
+  const String response = code == 200 ? cmdHttp.getString() : "";
+  if (code != 200) { cmdHttp.end(); cmdSessionUp = false; lastError = "Command HTTP " + String(code); return; }
   if (response.indexOf("\"command\":\"capture\"") >= 0) {
     String id;
     if (!commandId(response, id)) { lastError = "Invalid capture command"; return; }
@@ -313,7 +353,7 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) wifi(1000);
   ensureMdns();
   if (millis() - lastCommandPollAt >= kCommandPollMs) { lastCommandPollAt = millis(); pollCommand(); }
-  if (remoteStreaming && millis() - lastStreamFrameAt >= kStreamFrameMs) { lastStreamFrameAt = millis(); upload("", true); }
+  if (remoteStreaming && millis() - lastStreamFrameAt >= kStreamFrameMs) { lastStreamFrameAt = millis(); uploadLiveFrame(); }
   if (millis() - lastDiagnosticsAt >= 5000) {
     lastDiagnosticsAt = millis();
     Serial.printf("Health: camera=%s wifi=%d ip=%s\n", cameraReady ? "ready" : "failed", WiFi.status(), WiFi.localIP().toString().c_str());
