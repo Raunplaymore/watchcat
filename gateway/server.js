@@ -137,7 +137,56 @@ async function serveJpeg(res, filename) {
     return stream.pipe(res);
   } catch (error) { await handle.close(); return json(res, 500, { ok: false, error: error.message }); }
 }
-const page = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>watchcat camera</title><style>body{margin:0;background:#0b0e13;color:#dde;font:15px system-ui}main{max-width:720px;margin:auto;padding:1.2rem}h1{margin:.2rem 0 .8rem;letter-spacing:.06em;font-size:1.3rem}h1 a{color:#5a6a85;text-decoration:none;font-size:.75rem;float:right;margin-top:.4rem}strong{font-size:1.8rem}p{margin:.4rem 0;color:#9ab}img{max-width:100%;margin-top:.8rem;background:#0d1118;border-radius:12px}button{background:#1c2330;color:#dde;border:1px solid #334;border-radius:10px;padding:.55rem 1.1rem;margin:.5rem .5rem 0 0;font-size:.95rem}button:active{background:#2c4a66}.error{color:#f66}#rd{color:#9ab8dd}</style><main><h1>📷 WATCHCAT CAMERA <a href="https://watchcat.linkus-plz.com/">홈</a></h1><strong id=r>Loading…</strong><p id=d></p><p id=rd></p><button id=b>사진 촬영</button><button id=l>라이브 시작</button><img id=i alt="최근 사진"><script>const r=document.querySelector('#r'),d=document.querySelector('#d'),rd=document.querySelector('#rd'),i=document.querySelector('#i'),b=document.querySelector('#b'),l=document.querySelector('#l');let on=false,timer=0;async function x(){clearTimeout(timer);try{let s=await fetch('/api/v1/status').then(v=>v.json());on=Boolean(s.streamActive);const v=on&&s.liveFilename;const pend=s.capturePending||s.inferenceState==='waiting'||s.inferenceState==='running';l.textContent=s.streamPending?'대기 중…':on?'라이브 정지':'라이브 시작';r.textContent=v?'LIVE':pend?'오월이 어딧나...?':s.catPresent?'CAT FOUND':'NO CAT';d.textContent=v?'live preview · '+(s.liveAt??'-'):pend?'촬영 대기 중…':s.lastError||'confidence: '+(s.confidence??'-')+' · '+(s.processedAt??'-');d.className=!v&&s.lastError?'error':'';if(v)i.src='/api/v1/live.jpg?t='+Date.now();else if(s.latestFilename)i.src='/api/v1/latest.jpg?t='+Date.now();try{const q=await fetch('/api/v1/radar/status').then(v=>v.json());const t=q.targets&&q.targets[0];rd.textContent=q.sensorOnline?(q.radarOk?'레이더 온라인 · 타겟 '+q.targets.length+(t?' · x '+t.xMm+' y '+t.yMm+' mm · '+Math.round(t.speedMmPerSec/10)+' cm/s':''):'레이더 노드 온라인 · 레이더 무신호'):'레이더 오프라인'}catch(e){rd.textContent=''}}catch(e){r.textContent='GATEWAY ERROR';d.textContent=e.message}timer=setTimeout(x,on?700:2000)}b.onclick=()=>fetch('/api/v1/capture',{method:'POST'}).then(x);l.onclick=()=>fetch('/api/v1/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:!on})}).then(x);x();</script></main>`;
+const page = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>watchcat camera</title><style>
+body{margin:0;background:#0b0e13;color:#dde;font:15px system-ui}main{max-width:420px;margin:auto;padding:1rem}
+h1{margin:.2rem 0 .8rem;letter-spacing:.06em;font-size:1.1rem;color:#9ab8dd}h1 a{color:#5a6a85;text-decoration:none;font-size:.75rem;float:right;margin-top:.2rem}
+#tft{background:#000;border:3px solid #26314a;border-radius:26px;padding:16px 14px;aspect-ratio:240/300;max-width:340px;margin:auto;font-family:ui-monospace,SFMono-Regular,monospace;display:flex;flex-direction:column;overflow:hidden}
+#ct{color:#e8d45e;font-size:.85rem;letter-spacing:.12em}#dv{border:0;border-top:2px solid #e8d45e;margin:.4rem 0 .8rem}
+#body{flex:1;min-height:0;overflow:hidden}
+#big{font-size:1.5rem;margin:1.2rem 0 .8rem;font-weight:700}#msg{color:#bcd;font-size:.8rem;line-height:1.5;word-break:break-all}
+table{border-collapse:collapse;font-size:.78rem}td{padding:.18rem .6rem .18rem 0}td:first-child{color:#5ec8e8}
+.ph{position:relative;margin-top:.2rem}.ph img{width:100%;display:block;border-radius:4px;background:#0d1118}.bx{position:absolute;border:2px solid #5ee87f}
+#cap{color:#bcd;font-size:.72rem;margin-top:.4rem}
+#nav{margin-top:auto;padding-top:.5rem;font-size:.8rem;color:#fff}#act{font-size:.8rem;color:#fff}
+#pads{display:flex;justify-content:center;gap:1.6rem;margin:1.1rem 0}
+#pads button{width:64px;height:64px;border-radius:50%;background:#1c2330;border:2px solid #334;color:#dde;font-size:1.1rem}
+#pads button:active{background:#2c4a66}#pads span{display:block;text-align:center;color:#5a6a85;font-size:.7rem;margin-top:.3rem}
+</style><main><h1>📷 WATCHCAT CAMERA <a href="https://watchcat.linkus-plz.com/">홈</a></h1>
+<div id=tft><div id=ct>WATCHCAT</div><hr id=dv><div id=body></div><div id=nav></div><div id=act></div></div>
+<div id=pads><div><button id=b1>&#9664;</button><span>B1</span></div><div><button id=b2>&#9679;</button><span>B2</span></div><div><button id=b3>&#9654;</button><span>B3</span></div></div>
+</main><script>
+const $=id=>document.getElementById(id);
+const pages=['STATUS','PHOTO','LIVE','DETAIL'];
+const S={q:null,page:0,livePaused:false,token:localStorage.getItem('wcToken')||''};
+async function api(path,opts,retried){opts=opts||{};opts.headers=Object.assign({},opts.headers||{},S.token?{Authorization:'Bearer '+S.token}:{});const r=await fetch(path,opts);if(r.status===401&&!retried){const t=prompt('게이트웨이 토큰을 입력하세요 (한 번만)');if(t){S.token=t.trim();localStorage.setItem('wcToken',S.token);return api(path,opts,true)}}return r}
+function verdict(q){if(!q)return['대기','#e8d45e','게이트웨이 연결 중'];
+ const pend=q.capturePending||q.inferenceState==='waiting'||q.inferenceState==='running';
+ if(pend)return['기다리는 중','#e8d45e','Waiting for the sensor'];
+ if(q.catPresent)return['CAT FOUND','#5ee87f','confidence '+String(q.confidence||'').slice(0,5)];
+ if(q.inferenceState==='error')return['ERROR','#f66',q.lastError||''];
+ if(q.cameraOnline)return['NO CAT','#fff',q.confidence?'confidence '+String(q.confidence).slice(0,5):'Pi status received'];
+ return['CAMERA OFFLINE','#f66',q.lastError||'Gateway unavailable']}
+function actionOf(){return['CAPTURE','RELOAD',S.livePaused?'RESUME':'PAUSE','REFRESH'][S.page]}
+function chrome(){$('nav').textContent='< '+pages[S.page]+' >';$('act').textContent='B2: '+actionOf()}
+function renderStatus(){const[t,c,m]=verdict(S.q);$('body').innerHTML='<div id=big></div><div id=msg></div>';$('big').textContent=t;$('big').style.color=c;$('dv').style.borderColor=c;$('msg').textContent=m;chrome()}
+function renderPhoto(){const q=S.q||{};let bx='';(q.catBoxes||[]).forEach(b=>{bx+='<div class=bx style="left:'+(b[0]*100)+'%;top:'+(b[1]*100)+'%;width:'+(b[2]*100)+'%;height:'+(b[3]*100)+'%"></div>'});
+ $('body').innerHTML='<div class=ph><img src="/api/v1/latest.jpg?t='+Date.now()+'">'+bx+'</div><div id=cap>'+verdict(q)[0]+(q.processedAt?' · '+new Date(q.processedAt).toLocaleTimeString():'')+'</div>';$('dv').style.borderColor='#e8d45e';chrome()}
+function renderLive(){$('body').innerHTML='<div class=ph><img id=lv src="/api/v1/live.jpg?t='+Date.now()+'"></div><div id=cap>'+(S.livePaused?'일시정지':'live')+'</div>';$('dv').style.borderColor='#e8d45e';chrome()}
+function renderDetail(){const q=S.q||{};const rows=[['CONF',String(q.confidence||'-').slice(0,5)],['STATE',q.inferenceState||'-'],['CAT',q.catPresent?'yes':'no'],['SHOT',q.capturedAt||'-'],['DONE',q.processedAt?String(q.processedAt).slice(11,19):'-'],['FILE',q.latestFilename||'-'],['ERR',q.lastError||'-']];
+ $('body').innerHTML='<table>'+rows.map(r=>'<tr><td>'+r[0]+'</td><td>'+String(r[1]).replace(/</g,'&lt;')+'</td></tr>').join('')+'</table>';$('dv').style.borderColor='#5ec8e8';chrome()}
+function render(){[renderStatus,renderPhoto,renderLive,renderDetail][S.page]()}
+async function setStream(active){try{await api('/api/v1/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:active})})}catch(e){}}
+function movePage(d){const from=S.page;S.page=(S.page+d+4)%4;if(from===2&&S.page!==2)setStream(false);if(S.page===2){S.livePaused=false;setStream(true)}render()}
+async function select(){if(S.page===0){$('body').firstChild&&($('msg').textContent='Requesting...');const r=await api('/api/v1/capture',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});if(!r.ok)$('msg').textContent='요청 실패 HTTP '+r.status;else{poll()}}
+ else if(S.page===1)renderPhoto();
+ else if(S.page===2){S.livePaused=!S.livePaused;render()}
+ else{await poll()}}
+$('b1').onclick=()=>movePage(-1);$('b3').onclick=()=>movePage(1);$('b2').onclick=select;
+async function poll(){try{S.q=await fetch('/api/v1/status').then(r=>r.json())}catch(e){S.q=null}
+ if(S.page===0||S.page===3)render()}
+setInterval(poll,2000);poll().then(render);
+setInterval(()=>{if(S.page===2&&!S.livePaused){const lv=$('lv');if(lv)lv.src='/api/v1/live.jpg?t='+Date.now()}},700);
+</script>`;
 const radar = require('./radar')({ authorized });
 // The hub at watchcat.* fronts both projects: one glance-summary card each,
 // clicking through to the 1-depth pages /camera and /radar.
