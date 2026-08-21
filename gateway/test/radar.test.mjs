@@ -55,7 +55,12 @@ try {
 
   const empty = await post({ sensorId: 'living-room-radar-1', sequence: 8, targets: [] });
   check('empty batch is accepted (motion stopped)', empty.status === 202);
-  check('empty batch clears the served targets', (await status()).targets.length === 0);
+  const afterEmpty = await status();
+  check('empty batch clears the served targets', afterEmpty.targets.length === 0);
+  check('radarOk defaults to true', afterEmpty.radarOk === true);
+
+  await post({ sensorId: 'living-room-radar-1', sequence: 9, radarOk: false, targets: [] });
+  check('heartbeat marks the radar silent', (await status()).radarOk === false);
 
   check('unknown sensor is rejected', (await post({ sensorId: 'intruder', targets: [target] })).status === 403);
   check('missing sensorId is rejected', (await post({ targets: [target] })).status === 400);

@@ -46,7 +46,11 @@ Target targets[3];
 int targetCount = 0;
 bool batchFresh = false;
 uint32_t sequence = 0, framesParsed = 0, framesBad = 0, sendsOk = 0, sendsFailed = 0;
-uint32_t lastSendAt = 0, lastHealthAt = 0, lastWifiBeginAt = 0;
+uint32_t lastSendAt = 0, lastHealthAt = 0, lastWifiBeginAt = 0, lastFrameAt = 0;
+// With no radar frames the node still posts an empty batch on this cadence,
+// marked radarOk:false — otherwise "node dead" and "radar silent" look
+// identical from the gateway, which cost a live debugging session to tell apart.
+constexpr uint32_t kHeartbeatMs = 2000;
 bool wifiStarted = false;
 
 bool wifi() {
@@ -79,7 +83,7 @@ void decodeFrame(const uint8_t* body) {
     if (!xRaw && !yRaw && !speedRaw) continue;
     targets[targetCount++] = { signMagnitude(xRaw), signMagnitude(yRaw), signMagnitude(speedRaw) };
   }
-  sequence++; framesParsed++; batchFresh = true;
+  sequence++; framesParsed++; batchFresh = true; lastFrameAt = millis();
 }
 
 void pumpRadar() {
@@ -123,12 +127,16 @@ bool beginGateway() {
 }
 
 void sendLatest() {
-  if (!batchFresh || millis() - lastSendAt < kSendIntervalMs) return;
+  const uint32_t now = millis();
+  const bool radarOk = framesParsed && now - lastFrameAt < 1000;
+  if (now - lastSendAt < (batchFresh ? kSendIntervalMs : kHeartbeatMs)) return;
   if (!wifi()) return;
   if (!sessionUp) sessionUp = beginGateway();
   if (!sessionUp) { sendsFailed++; lastSendAt = millis(); return; }
-  String body = String("{\"sensorId\":\"") + WATCHCAT_RADAR_SENSOR_ID + "\",\"sequence\":" + sequence + ",\"targets\":[";
-  for (int i = 0; i < targetCount; i++) {
+  String body = String("{\"sensorId\":\"") + WATCHCAT_RADAR_SENSOR_ID + "\",\"sequence\":" + sequence +
+                ",\"radarOk\":" + (radarOk ? "true" : "false") + ",\"targets\":[";
+  // A heartbeat carries no targets: whatever sits in the slots is a stale batch.
+  for (int i = 0; batchFresh && i < targetCount; i++) {
     if (i) body += ',';
     body += String("{\"xMm\":") + targets[i].xMm + ",\"yMm\":" + targets[i].yMm +
             ",\"speedMmPerSec\":" + (targets[i].speedCmPerSec * 10) + "}";

@@ -52,8 +52,11 @@ module.exports = function createRadar({ authorized }) {
     const targets = normalizeTargets(payload.targets ?? []);
     if (!targets) return json(res, 400, { ok: false, error: 'Invalid targets' });
     const sequence = Number.isFinite(Number(payload.sequence)) ? Number(payload.sequence) : null;
+    // radarOk:false marks a node heartbeat sent while the radar itself is silent,
+    // so the map can tell "node dead" from "radar unplugged". Absent means true.
+    const radarOk = payload.radarOk !== false;
     const now = Date.now();
-    observations.push({ receivedAt: now, sensorId, sequence, targets });
+    observations.push({ receivedAt: now, sensorId, sequence, targets, radarOk });
     prune(now);
     return json(res, 202, { ok: true, accepted: true });
   }
@@ -65,6 +68,7 @@ module.exports = function createRadar({ authorized }) {
     return json(res, 200, {
       ok: true,
       sensorOnline: Boolean(latest && now - latest.receivedAt <= ONLINE_MS),
+      radarOk: Boolean(latest && latest.radarOk !== false),
       sensorId: latest ? latest.sensorId : null,
       lastObservedAt: latest ? new Date(latest.receivedAt).toISOString() : null,
       lastSequence: latest ? latest.sequence : null,
@@ -76,7 +80,7 @@ module.exports = function createRadar({ authorized }) {
   // Sector view: the sensor sits at the wedge's apex, +Y points away from it,
   // ±60° matches the LD2454's azimuth. Trails live client-side (10 s fade) since
   // the status endpoint only serves the latest batch.
-  const page = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>watchcat radar</title><style>body{margin:0;background:#0b0e13;color:#dde;font:14px system-ui}main{max-width:640px;margin:auto;padding:1rem}h2{margin:.2rem 0 .6rem}canvas{width:100%;background:#10141c;border-radius:12px;margin-top:.6rem}#s{color:#8ab;margin:.2rem 0}.on{color:#5ee87f}.off{color:#f66}button{background:#1c2330;color:#dde;border:1px solid #334;border-radius:8px;padding:.3rem .9rem;margin-right:.4rem}button.sel{background:#2c4a66}</style><main><h2>WATCHCAT RADAR</h2><p id=s>연결 중…</p><div id=z><button data-r=2000>2m</button><button data-r=4000 class=sel>4m</button><button data-r=8000>8m</button></div><canvas id=c width=640 height=560></canvas></main><script>
+  const page = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>watchcat radar</title><style>body{margin:0;background:#0b0e13;color:#dde;font:14px system-ui}main{max-width:640px;margin:auto;padding:1rem}h2{margin:.2rem 0 .6rem}canvas{width:100%;background:#10141c;border-radius:12px;margin-top:.6rem}#s{color:#8ab;margin:.2rem 0}.on{color:#5ee87f}.off{color:#f66}.warn{color:#e8b45e}button{background:#1c2330;color:#dde;border:1px solid #334;border-radius:8px;padding:.3rem .9rem;margin-right:.4rem}button.sel{background:#2c4a66}</style><main><h2>WATCHCAT RADAR</h2><p id=s>연결 중…</p><div id=z><button data-r=2000>2m</button><button data-r=4000 class=sel>4m</button><button data-r=8000>8m</button></div><canvas id=c width=640 height=560></canvas></main><script>
 const cv=document.getElementById('c'),g=cv.getContext('2d'),st=document.getElementById('s');
 let maxR=4000;const trails=[];const colors=['#5ee87f','#5ec8e8','#e8d45e'];
 document.querySelectorAll('#z button').forEach(b=>b.onclick=()=>{maxR=Number(b.dataset.r);document.querySelectorAll('#z button').forEach(x=>x.classList.toggle('sel',x===b))});
@@ -127,7 +131,7 @@ async function tick(){clearTimeout(timer);let q=null;
  for(const t of targets)trails.push({x:t.xMm,y:t.yMm,t:now});
  while(trails.length&&now-trails[0].t>10000)trails.shift();
  updateBlobs(targets,now);
- st.innerHTML=q?((q.sensorOnline?'<span class=on>레이더 온라인</span>':'<span class=off>레이더 오프라인</span>')+' · 타겟 '+((q.targets||[]).length)+' · '+(q.lastObservedAt?new Date(q.lastObservedAt).toLocaleTimeString():'-')):'게이트웨이 연결 실패';
+ st.innerHTML=q?((q.sensorOnline?(q.radarOk?'<span class=on>레이더 온라인</span>':'<span class=warn>노드 온라인 · 레이더 무신호</span>'):'<span class=off>레이더 오프라인</span>')+' · 타겟 '+((q.targets||[]).length)+' · '+(q.lastObservedAt?new Date(q.lastObservedAt).toLocaleTimeString():'-')):'게이트웨이 연결 실패';
  draw(targets,Boolean(q&&q.sensorOnline));
  timer=setTimeout(tick,500)}
 tick();
