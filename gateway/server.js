@@ -139,6 +139,28 @@ async function serveJpeg(res, filename) {
 }
 const page = `<!doctype html><meta charset="utf-8"><title>watchcat</title><style>body{background:#101216;color:white;font:16px system-ui;margin:2rem}main{max-width:720px;margin:auto}strong{font-size:2rem}img{max-width:100%;margin-top:1rem;background:#222;border-radius:12px}button{margin-right:.5rem}.error{color:#ff7777}</style><main><h1>WATCHCAT</h1><strong id=r>Loading…</strong><p id=d></p><p id=rd style="color:#9ad"></p><button id=b>사진 촬영</button><button id=l>라이브 시작</button><img id=i alt="최근 사진"><script>const r=document.querySelector('#r'),d=document.querySelector('#d'),rd=document.querySelector('#rd'),i=document.querySelector('#i'),b=document.querySelector('#b'),l=document.querySelector('#l');let on=false,timer=0;async function x(){clearTimeout(timer);try{let s=await fetch('/api/v1/status').then(v=>v.json());on=Boolean(s.streamActive);const v=on&&s.liveFilename;const pend=s.capturePending||s.inferenceState==='waiting'||s.inferenceState==='running';l.textContent=s.streamPending?'대기 중…':on?'라이브 정지':'라이브 시작';r.textContent=v?'LIVE':pend?'오월이 어딧나...?':s.catPresent?'CAT FOUND':'NO CAT';d.textContent=v?'live preview · '+(s.liveAt??'-'):pend?'촬영 대기 중…':s.lastError||'confidence: '+(s.confidence??'-')+' · '+(s.processedAt??'-');d.className=!v&&s.lastError?'error':'';if(v)i.src='/api/v1/live.jpg?t='+Date.now();else if(s.latestFilename)i.src='/api/v1/latest.jpg?t='+Date.now();try{const q=await fetch('/api/v1/radar/status').then(v=>v.json());const t=q.targets&&q.targets[0];rd.textContent=q.sensorOnline?(q.radarOk?'레이더 온라인 · 타겟 '+q.targets.length+(t?' · x '+t.xMm+' y '+t.yMm+' mm · '+Math.round(t.speedMmPerSec/10)+' cm/s':''):'레이더 노드 온라인 · 레이더 무신호'):'레이더 오프라인'}catch(e){rd.textContent=''}}catch(e){r.textContent='GATEWAY ERROR';d.textContent=e.message}timer=setTimeout(x,on?700:2000)}b.onclick=()=>fetch('/api/v1/capture',{method:'POST'}).then(x);l.onclick=()=>fetch('/api/v1/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:!on})}).then(x);x();</script></main>`;
 const radar = require('./radar')({ authorized });
+// The hub at watchcat.* fronts both projects: one glance-summary card each,
+// clicking through to the 1-depth pages /camera and /radar.
+const hubPage = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>watchcat</title><style>body{margin:0;background:#0b0e13;color:#dde;font:15px system-ui}main{max-width:720px;margin:auto;padding:1.2rem}h1{margin:.2rem 0 .1rem;letter-spacing:.06em}#tg{color:#8ab;margin:0 0 1rem}a.card{display:block;background:#141a26;border:1px solid #26314a;border-radius:14px;padding:1rem 1.1rem;margin-bottom:1rem;text-decoration:none;color:#dde}a.card:active{background:#1a2233}h2{margin:0 0 .4rem;font-size:1.05rem;color:#9ab8dd}strong{font-size:1.5rem}p{margin:.3rem 0 0;color:#9ab}img{width:100%;margin-top:.7rem;border-radius:10px;background:#0d1118}.on{color:#5ee87f}.warn{color:#e8b45e}.off{color:#f66}#go{color:#5a6a85;font-size:.85rem;float:right;margin-top:.2rem}</style><main><h1>WATCHCAT</h1><p id=tg>오월이 관측 시스템</p><a class=card href="/camera"><span id=go>카메라 →</span><h2>📷 카메라 · Hailo 판정</h2><strong id=cs>…</strong><p id=cd></p><img id=ci alt="최근 사진"></a><a class=card href="/radar"><span id=go2 style="color:#5a6a85;font-size:.85rem;float:right;margin-top:.2rem">레이더 →</span><h2>📡 레이더 · 위치 추적</h2><strong id=rs>…</strong><p id=rd3></p></a></main><script>
+const cs=document.getElementById('cs'),cd=document.getElementById('cd'),ci=document.getElementById('ci'),rs=document.getElementById('rs'),rd3=document.getElementById('rd3');
+let timer=0;
+async function tick(){clearTimeout(timer);
+ try{const s=await fetch('/api/v1/status').then(v=>v.json());
+  const pend=s.capturePending||s.inferenceState==='waiting'||s.inferenceState==='running';
+  cs.textContent=pend?'판정 중…':s.catPresent?'CAT FOUND':s.inferenceState==='error'?'ERROR':s.cameraOnline?'NO CAT':'대기';
+  cs.className=s.catPresent?'on':'';
+  cd.textContent=pend?'촬영 대기 중':(s.confidence?'confidence '+String(s.confidence).slice(0,5)+' · ':'')+(s.processedAt?new Date(s.processedAt).toLocaleTimeString():'기록 없음');
+  if(s.latestFilename)ci.src='/api/v1/latest.jpg?t='+Math.floor(Date.now()/30000);
+ }catch(e){cs.textContent='게이트웨이 오류';cs.className='off'}
+ try{const q=await fetch('/api/v1/radar/status').then(v=>v.json());
+  const t=q.targets&&q.targets[0];
+  rs.textContent=q.sensorOnline?(q.radarOk?(q.targets.length?'움직임 '+q.targets.length+'건':'움직임 없음'):'레이더 무신호'):'오프라인';
+  rs.className=q.sensorOnline?(q.radarOk?'on':'warn'):'off';
+  rd3.textContent=t?('전방 '+(t.yMm/1000).toFixed(2)+'m · 좌우 '+(t.xMm/1000).toFixed(2)+'m · '+Math.round(t.speedMmPerSec/10)+'cm/s'):(q.lastObservedAt?'마지막 신호 '+new Date(q.lastObservedAt).toLocaleTimeString():'신호 기록 없음');
+ }catch(e){rs.textContent='게이트웨이 오류';rs.className='off'}
+ timer=setTimeout(tick,2000)}
+tick();
+</script>`;
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   if (url.pathname.startsWith('/api/v1/radar/')) return radar.handle(req, res, url);
@@ -147,7 +169,12 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     return res.end(radar.page);
   }
-  if (req.method === 'GET' && url.pathname === '/') { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); return res.end(page); }
+  // Host-based fronts: watchcat.* gets the hub; radar.* keeps its map at /;
+  // every other host (watchcat-api, the monitor's base URL) keeps the camera
+  // page at / so nothing that already points there changes behaviour.
+  const host = String(req.headers.host || '');
+  if (req.method === 'GET' && url.pathname === '/' && host.startsWith('watchcat.')) { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); return res.end(hubPage); }
+  if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/camera')) { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); return res.end(page); }
   if (req.method === 'GET' && url.pathname === '/api/v1/status') return json(res, 200, { ok: true, ...state, capturePending: Boolean(captureCommand), streamPending: Boolean(streamCommand), streamActive });
   if (req.method === 'GET' && url.pathname === '/api/v1/latest.jpg') return serveJpeg(res, state.latestFilename);
   if (req.method === 'GET' && url.pathname === '/api/v1/live.jpg') return serveJpeg(res, state.liveFilename);
