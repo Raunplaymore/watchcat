@@ -59,6 +59,29 @@ async function infer(job) {
     state = { ...state, inferenceState: 'complete', catPresent: cats.length > 0, confidence: cats.length ? confidence : null, catBoxes, processedAt: new Date().toISOString(), lastCatAt: cats.length ? new Date().toISOString() : state.lastCatAt, lastError: null };
   } catch (error) { state = { ...state, inferenceState: 'error', catPresent: false, confidence: null, catBoxes: [], processedAt: new Date().toISOString(), lastError: error.message }; }
 }
+// MJPEG fan-out: one long-lived multipart response per viewer, each new live
+// frame pushed the moment the sensor uploads it. A viewer whose socket has
+// unsent bytes piled up simply skips frames — memory per viewer stays bounded
+// by one frame instead of growing with a slow connection.
+const LIVE_VIEWER_LIMIT = Number(process.env.WATCHCAT_LIVE_VIEWER_LIMIT || 6);
+const liveViewers = new Set();
+function writeFramePart(res, image) {
+  if (res.writableLength > 200_000) return;
+  res.write(`--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${image.length}\r\n\r\n`);
+  res.write(image);
+  res.write('\r\n');
+}
+async function liveStream(req, res) {
+  if (liveViewers.size >= LIVE_VIEWER_LIMIT) return json(res, 503, { ok: false, error: 'Too many live viewers' });
+  res.writeHead(200, { 'Content-Type': 'multipart/x-mixed-replace; boundary=frame', 'Cache-Control': 'no-store' });
+  // Node holds headers back until the first body write; without a flush a viewer
+  // that connects before any frame arrives would wait on headers forever.
+  res.flushHeaders();
+  liveViewers.add(res);
+  req.on('close', () => liveViewers.delete(res));
+  // Seed with the stored live frame so the viewer is not blank until the next tick.
+  if (state.liveFilename) { try { writeFramePart(res, await fsp.readFile(path.join(UPLOAD_DIR, state.liveFilename))); } catch {} }
+}
 async function frame(req, res) {
   if (!authorized(req)) return json(res, 401, { ok: false, error: 'Unauthorized' });
   if (!String(req.headers['content-type'] || '').startsWith('image/jpeg')) return json(res, 415, { ok: false, error: 'Content-Type must be image/jpeg' });
@@ -70,6 +93,7 @@ async function frame(req, res) {
     await fsp.writeFile(`${file}.part`, image); await fsp.rename(`${file}.part`, file);
     if (streaming) {
       state = { ...state, cameraOnline: true, liveFilename: filename, liveAt: req.headers['x-watchcat-captured-at'] || new Date().toISOString() };
+      for (const viewer of liveViewers) writeFramePart(viewer, image);
       return json(res, 202, { ok: true, streaming: true });
     }
     if (captureCommand && req.headers['x-watchcat-command-id'] === captureCommand.id) captureCommand = null;
@@ -171,7 +195,7 @@ function chrome(){$('nav').textContent='< '+pages[S.page]+' >';$('act').textCont
 function renderStatus(){const[t,c,m]=verdict(S.q);$('body').innerHTML='<div id=big></div><div id=msg></div>';$('big').textContent=t;$('big').style.color=c;$('dv').style.borderColor=c;$('msg').textContent=m;chrome()}
 function renderPhoto(){const q=S.q||{};let bx='';(q.catBoxes||[]).forEach(b=>{bx+='<div class=bx style="left:'+(b[0]*100)+'%;top:'+(b[1]*100)+'%;width:'+(b[2]*100)+'%;height:'+(b[3]*100)+'%"></div>'});
  $('body').innerHTML='<div class=ph><img src="/api/v1/latest.jpg?t='+Date.now()+'">'+bx+'</div><div id=cap>'+verdict(q)[0]+(q.processedAt?' · '+new Date(q.processedAt).toLocaleTimeString():'')+'</div>';$('dv').style.borderColor='#e8d45e';chrome()}
-function renderLive(){$('body').innerHTML='<div class=ph><img id=lv src="/api/v1/live.jpg?t='+Date.now()+'"></div><div id=cap>'+(S.livePaused?'일시정지':'live')+'</div>';$('dv').style.borderColor='#e8d45e';chrome()}
+function renderLive(){const src=S.livePaused?'/api/v1/live.jpg?t='+Date.now():'/api/v1/live.mjpeg';$('body').innerHTML='<div class=ph><img id=lv src="'+src+'"></div><div id=cap>'+(S.livePaused?'일시정지':'live (mjpeg)')+'</div>';$('dv').style.borderColor='#e8d45e';chrome()}
 function renderDetail(){const q=S.q||{};const rows=[['CONF',String(q.confidence||'-').slice(0,5)],['STATE',q.inferenceState||'-'],['CAT',q.catPresent?'yes':'no'],['SHOT',q.capturedAt||'-'],['DONE',q.processedAt?String(q.processedAt).slice(11,19):'-'],['FILE',q.latestFilename||'-'],['ERR',q.lastError||'-']];
  $('body').innerHTML='<table>'+rows.map(r=>'<tr><td>'+r[0]+'</td><td>'+String(r[1]).replace(/</g,'&lt;')+'</td></tr>').join('')+'</table>';$('dv').style.borderColor='#5ec8e8';chrome()}
 function render(){[renderStatus,renderPhoto,renderLive,renderDetail][S.page]()}
@@ -185,7 +209,6 @@ $('b1').onclick=()=>movePage(-1);$('b3').onclick=()=>movePage(1);$('b2').onclick
 async function poll(){try{S.q=await fetch('/api/v1/status').then(r=>r.json())}catch(e){S.q=null}
  if(S.page===0||S.page===3)render()}
 setInterval(poll,2000);poll().then(render);
-setInterval(()=>{if(S.page===2&&!S.livePaused){const lv=$('lv');if(lv)lv.src='/api/v1/live.jpg?t='+Date.now()}},700);
 </script>`;
 const radar = require('./radar')({ authorized });
 // The hub at watchcat.* fronts both projects: one glance-summary card each,
@@ -242,6 +265,7 @@ const server = http.createServer((req, res) => {
   if (req.method === 'GET' && url.pathname === '/api/v1/status') return json(res, 200, { ok: true, ...state, capturePending: Boolean(captureCommand), streamPending: Boolean(streamCommand), streamActive });
   if (req.method === 'GET' && url.pathname === '/api/v1/latest.jpg') return serveJpeg(res, state.latestFilename);
   if (req.method === 'GET' && url.pathname === '/api/v1/live.jpg') return serveJpeg(res, state.liveFilename);
+  if (req.method === 'GET' && url.pathname === '/api/v1/live.mjpeg') return liveStream(req, res);
   if (req.method === 'POST' && url.pathname === '/api/v1/frames') return frame(req, res);
   if (req.method === 'POST' && url.pathname === '/api/v1/capture') return capture(req, res);
   if (req.method === 'POST' && url.pathname === '/api/v1/stream') return stream(req, res);
