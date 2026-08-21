@@ -80,6 +80,27 @@ module.exports = function createRadar({ authorized }) {
 const cv=document.getElementById('c'),g=cv.getContext('2d'),st=document.getElementById('s');
 let maxR=4000;const trails=[];const colors=['#5ee87f','#5ec8e8','#e8d45e'];
 document.querySelectorAll('#z button').forEach(b=>b.onclick=()=>{maxR=Number(b.dataset.r);document.querySelectorAll('#z button').forEach(x=>x.classList.toggle('sel',x===b))});
+// Size proxy: the radar reports a point, but a bigger body wanders more around
+// its own path (the reflection centre migrates over the torso). Track each
+// target across polls by nearest-neighbour and measure RMS deviation from the
+// straight line through its 3-second window — drawn as a bubble.
+const blobs=[];
+function updateBlobs(targets,now){
+ for(const b of blobs)b.matched=false;
+ for(const t of targets){let best=null,bd=600;
+  for(const b of blobs){if(b.matched)continue;const d=Math.hypot(t.xMm-b.x,t.yMm-b.y);if(d<bd){bd=d;best=b}}
+  if(best){best.matched=true;best.x=t.xMm;best.y=t.yMm;best.speed=t.speedMmPerSec;best.hist.push({x:t.xMm,y:t.yMm,t:now})}
+  else blobs.push({x:t.xMm,y:t.yMm,speed:t.speedMmPerSec,matched:true,hist:[{x:t.xMm,y:t.yMm,t:now}]})}
+ for(let i=blobs.length-1;i>=0;i--){const b=blobs[i];b.hist=b.hist.filter(h=>now-h.t<3000);
+  if(!b.matched&&(!b.hist.length||now-b.hist[b.hist.length-1].t>1500))blobs.splice(i,1)}
+}
+function spreadOf(hist){
+ if(hist.length<3)return 0;
+ const a=hist[0],z=hist[hist.length-1],dx=z.x-a.x,dy=z.y-a.y,len2=dx*dx+dy*dy||1;
+ let s=0;
+ for(const h of hist){const t=((h.x-a.x)*dx+(h.y-a.y)*dy)/len2,px=a.x+t*dx,py=a.y+t*dy;s+=(h.x-px)*(h.x-px)+(h.y-py)*(h.y-py)}
+ return Math.sqrt(s/hist.length);
+}
 function draw(targets,online){
  const W=cv.width,H=cv.height,cx=W/2,cy=H-36,sc=(H-84)/maxR,a0=-Math.PI/2-Math.PI/3,a1=-Math.PI/2+Math.PI/3;
  g.clearRect(0,0,W,H);
@@ -89,7 +110,10 @@ function draw(targets,online){
  g.strokeStyle='#233049';g.beginPath();g.moveTo(cx,cy);g.lineTo(cx,cy-maxR*sc);g.stroke();
  const now=Date.now();
  for(const p of trails){const age=(now-p.t)/10000;if(age>1)continue;g.fillStyle='rgba(94,232,127,'+(0.45*(1-age)).toFixed(3)+')';g.beginPath();g.arc(cx+p.x*sc,cy-p.y*sc,3,0,7);g.fill()}
- targets.forEach((t,i)=>{const px=cx+t.xMm*sc,py=cy-t.yMm*sc;g.fillStyle=colors[i%3];g.beginPath();g.arc(px,py,7,0,7);g.fill();g.fillStyle='#dde';g.fillText((t.yMm/1000).toFixed(2)+'m · '+Math.round(t.speedMmPerSec/10)+'cm/s',px+10,py-8)});
+ blobs.forEach((b,i)=>{const px=cx+b.x*sc,py=cy-b.y*sc,sp=spreadOf(b.hist),rr=Math.max(sp*sc,10);
+  g.fillStyle='rgba(94,232,127,0.14)';g.strokeStyle='rgba(94,232,127,0.4)';g.beginPath();g.arc(px,py,rr,0,7);g.fill();g.stroke();
+  g.fillStyle=colors[i%3];g.beginPath();g.arc(px,py,7,0,7);g.fill();
+  g.fillStyle='#dde';g.fillText((b.y/1000).toFixed(2)+'m · '+Math.round(b.speed/10)+'cm/s'+(sp?' · ±'+Math.round(sp/10)+'cm':''),px+10,py-8)});
  g.fillStyle=online?'#5ee87f':'#e85e5e';g.beginPath();g.arc(cx,cy,6,0,7);g.fill();
 }
 let timer=0;
@@ -99,6 +123,7 @@ async function tick(){clearTimeout(timer);let q=null;
  const now=Date.now();
  for(const t of targets)trails.push({x:t.xMm,y:t.yMm,t:now});
  while(trails.length&&now-trails[0].t>10000)trails.shift();
+ updateBlobs(targets,now);
  st.innerHTML=q?((q.sensorOnline?'<span class=on>레이더 온라인</span>':'<span class=off>레이더 오프라인</span>')+' · 타겟 '+((q.targets||[]).length)+' · '+(q.lastObservedAt?new Date(q.lastObservedAt).toLocaleTimeString():'-')):'게이트웨이 연결 실패';
  draw(targets,Boolean(q&&q.sensorOnline));
  timer=setTimeout(tick,500)}
