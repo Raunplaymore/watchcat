@@ -55,7 +55,9 @@ async function infer(job) {
     // Boxes ride along normalized [x, y, w, h] so the monitor can paint them over
     // the photo. Rounded to 3 decimals — the monitor parses this JSON by hand and
     // full doubles would only bloat what it has to scan.
-    const catBoxes = cats.slice(0, 4).map(item => Array.isArray(item.bbox) && item.bbox.length === 4 ? item.bbox.map(value => Math.round(Number(value) * 1000) / 1000) : null).filter(Boolean);
+    // Hailo runs the same still through several frames, so identical detections
+    // repeat; dedupe or one cat shows up as four stacked boxes.
+    const catBoxes = [...new Set(cats.map(item => Array.isArray(item.bbox) && item.bbox.length === 4 ? JSON.stringify(item.bbox.map(value => Math.round(Number(value) * 1000) / 1000)) : null).filter(Boolean))].slice(0, 4).map(JSON.parse);
     state = { ...state, inferenceState: 'complete', catPresent: cats.length > 0, confidence: cats.length ? confidence : null, catBoxes, processedAt: new Date().toISOString(), lastCatAt: cats.length ? new Date().toISOString() : state.lastCatAt, lastError: null };
   } catch (error) { state = { ...state, inferenceState: 'error', catPresent: false, confidence: null, catBoxes: [], processedAt: new Date().toISOString(), lastError: error.message }; }
 }

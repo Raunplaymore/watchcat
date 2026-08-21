@@ -27,10 +27,12 @@ camera_config_t kCamera = {
   .pin_d1=17, .pin_d0=15, .pin_vsync=38, .pin_href=47, .pin_pclk=13,
   .xclk_freq_hz=20000000, .ledc_timer=LEDC_TIMER_0, .ledc_channel=LEDC_CHANNEL_0,
   // The driver sizes the JPEG frame buffer as width*height/5 (384 KB at UXGA)
-  // regardless of quality, and drops any frame that overflows it. Quality 2 was
-  // measured to exceed that once AEC brightens the scene — every still failed
-  // at esp_camera_fb_get() — so 4 (~200 KB) is the practical ceiling here.
-  .pixel_format=PIXFORMAT_JPEG, .frame_size=FRAMESIZE_UXGA, .jpeg_quality=4,
+  // regardless of quality, and drops any frame that overflows it. Quality 2
+  // exceeded that outright, and quality 4 was measured at 313-343 KB in bright
+  // indoor scenes — close enough that busier scenes still overflowed and every
+  // still failed at esp_camera_fb_get(). Even 6 measured 312 KB (81%) in a busy
+  // night scene, so 8 buys the margin detection can afford to give.
+  .pixel_format=PIXFORMAT_JPEG, .frame_size=FRAMESIZE_UXGA, .jpeg_quality=8,
   .fb_count=2, .fb_location=CAMERA_FB_IN_PSRAM, .grab_mode=CAMERA_GRAB_LATEST,
 };
 WebServer server(80);
@@ -164,11 +166,24 @@ bool beginGateway(HTTPClient& http, WiFiClientSecure& secureClient, const String
   if (!http.begin(endpoint)) { lastError = "Gateway HTTP connection setup failed"; return false; }
   return true;
 }
+// The camera can wedge at runtime — after ~47 minutes of continuous streaming
+// every esp_camera_fb_get() returned null until a power cycle, with no remote
+// way to recover. Consecutive grab failures now reboot the node; any successful
+// grab resets the count, so live traffic keeps a healthy camera far from the
+// threshold.
+uint8_t consecutiveGrabFailures = 0;
+void noteGrabFailure() {
+  if (++consecutiveGrabFailures < 4) return;
+  Serial.println("Camera wedged: restarting");
+  delay(100);
+  esp_restart();
+}
 bool upload(const String& commandId = "", bool isStreaming = false) {
   if (!cameraReady) { lastError = "Camera not ready"; return false; }
   if (!wifi()) { lastError = "Wi-Fi unavailable"; return false; }
   camera_fb_t* frame = esp_camera_fb_get();
-  if (!frame) { lastError = "Capture failed"; return false; }
+  if (!frame) { lastError = "Capture failed"; noteGrabFailure(); return false; }
+  consecutiveGrabFailures = 0;
   const String endpoint = String(WATCHCAT_CAMERA_UPLOAD_BASE_URL) + "/api/v1/frames";
   HTTPClient http;
   WiFiClientSecure secureClient;
