@@ -217,7 +217,7 @@ async function poll(){try{S.q=await fetch('/api/v1/status').then(r=>r.json())}ca
  if(S.page===0||S.page===3)render()}
 setInterval(poll,2000);poll().then(render);
 </script>`;
-const radar = require('./radar')({ authorized });
+const radar = require('./radar')({ authorized, eventDir: path.join(UPLOAD_DIR, 'radar-events') });
 // The hub at watchcat.* fronts both projects: one glance-summary card each,
 // clicking through to the 1-depth pages /camera and /radar.
 const hubPage = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>watchcat</title><style>body{margin:0;background:#0b0e13;color:#dde;font:15px system-ui}main{max-width:720px;margin:auto;padding:1.2rem}h1{margin:.2rem 0 .1rem;letter-spacing:.06em}#tg{color:#8ab;margin:0 0 1rem}a.card{display:block;background:#141a26;border:1px solid #26314a;border-radius:14px;padding:1rem 1.1rem;margin-bottom:1rem;text-decoration:none;color:#dde}a.card:active{background:#1a2233}h2{margin:0 0 .4rem;font-size:1.05rem;color:#9ab8dd}strong{font-size:1.5rem}p{margin:.3rem 0 0;color:#9ab}img{width:100%;margin-top:.7rem;border-radius:10px;background:#0d1118}.on{color:#5ee87f}.warn{color:#e8b45e}.off{color:#f66}#go{color:#5a6a85;font-size:.85rem;float:right;margin-top:.2rem}</style><main><h1>WATCHCAT</h1><p id=tg>오월이 관측 시스템</p><a class=card href="/camera"><span id=go>카메라 →</span><h2>📷 카메라 · Hailo 판정</h2><strong id=cs>…</strong><p id=cd></p></a><a class=card href="/radar"><span id=go2 style="color:#5a6a85;font-size:.85rem;float:right;margin-top:.2rem">레이더 →</span><h2>📡 레이더 · 위치 추적</h2><strong id=rs>…</strong><p id=rd3></p></a></main><script>
@@ -234,7 +234,7 @@ async function tick(){clearTimeout(timer);
   const t=q.targets&&q.targets[0];
   rs.textContent=q.sensorOnline?(q.radarOk?(q.targets.length?'움직임 '+q.targets.length+'건':'움직임 없음'):'레이더 무신호'):'오프라인';
   rs.className=q.sensorOnline?(q.radarOk?'on':'warn'):'off';
-  rd3.textContent=t?('전방 '+(t.yMm/1000).toFixed(2)+'m · 좌우 '+(t.xMm/1000).toFixed(2)+'m · '+Math.round(t.speedMmPerSec/10)+'cm/s'):(q.lastObservedAt?'마지막 신호 '+new Date(q.lastObservedAt).toLocaleTimeString():'신호 기록 없음');
+  rd3.textContent=(t?('전방 '+(t.yMm/1000).toFixed(2)+'m · 좌우 '+(t.xMm/1000).toFixed(2)+'m · '+Math.round(t.speedMmPerSec/10)+'cm/s'):(q.lastObservedAt?'마지막 신호 '+new Date(q.lastObservedAt).toLocaleTimeString():'신호 기록 없음'))+(q.eventsToday?' · 오늘 움직임 '+q.eventsToday+'건':'');
  }catch(e){rs.textContent='게이트웨이 오류';rs.className='off'}
  timer=setTimeout(tick,2000)}
 tick();

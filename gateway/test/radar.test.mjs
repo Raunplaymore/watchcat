@@ -2,7 +2,7 @@
 // window. Runs with a 150 ms window/online threshold so staleness is testable
 // without real waiting.
 import { spawn } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -28,6 +28,7 @@ const server = spawn(process.execPath, [serverPath], {
     HAILO_CAMERA_URL: 'http://127.0.0.1:9',
     WATCHCAT_RADAR_SENSORS: 'living-room-radar-1',
     WATCHCAT_RADAR_WINDOW_MS: '150', WATCHCAT_RADAR_ONLINE_MS: '150',
+    WATCHCAT_RADAR_EVENT_LOST_MS: '120', WATCHCAT_RADAR_EVENT_IDLE_MS: '200',
   },
   stdio: ['ignore', 'ignore', 'inherit'],
 });
@@ -75,6 +76,32 @@ try {
   const stale = await status();
   check('sensor goes offline past the window', stale.sensorOnline === false);
   check('window pruning empties the buffer', stale.observationsInWindow === 0, String(stale.observationsInWindow));
+
+  // Movement episodes: enough travel opens one, stopping closes it, jitter never records.
+  const walk = [[0, 1000], [0, 1400], [-100, 1800], [-200, 2200]];
+  for (const [xMm, yMm] of walk) {
+    await post({ sensorId: 'living-room-radar-1', targets: [{ xMm, yMm, speedMmPerSec: 200 }] });
+    await new Promise(r => setTimeout(r, 30));
+  }
+  await new Promise(r => setTimeout(r, 250));
+  await status(); // the GET runs the close sweep
+  const episodes = await fetch(`${BASE}/api/v1/radar/events`).then(r => r.json());
+  check('movement episode is recorded', episodes.ok === true && episodes.events.length === 1, JSON.stringify(episodes.events));
+  const episode = episodes.events[0] || {};
+  check('episode carries its path', Array.isArray(episode.points) && episode.points.length === 4 && episode.pathMm >= 1200, JSON.stringify(episode));
+  check('retention rides along', episodes.retentionDays === 7);
+  check('status counts today', (await status()).eventsToday === 1);
+
+  await post({ sensorId: 'living-room-radar-1', targets: [{ xMm: 3000, yMm: 3000, speedMmPerSec: 0 }] });
+  await post({ sensorId: 'living-room-radar-1', targets: [{ xMm: 3050, yMm: 3010, speedMmPerSec: 0 }] });
+  await new Promise(r => setTimeout(r, 250));
+  await status();
+  const afterParked = await fetch(`${BASE}/api/v1/radar/events`).then(r => r.json());
+  check('parked jitter records nothing', afterParked.events.length === 1, String(afterParked.events.length));
+
+  await new Promise(r => setTimeout(r, 100));
+  const dayFiles = await readdir(path.join(uploadDir, 'radar-events')).catch(() => []);
+  check('episode persisted to a day file', dayFiles.length === 1, dayFiles.join(','));
 } finally {
   server.kill();
   await rm(uploadDir, { recursive: true, force: true });

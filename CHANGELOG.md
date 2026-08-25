@@ -1,5 +1,31 @@
 # Changelog
 
+## 2026-08-25 (밤)
+
+### 탐지 라벨 확장 (cat|dog|person)
+
+- **미탐 원인 실증** — 모델이 흰 고양이의 "앉은 뒷모습"을 dog 0.727로 분류
+  (bbox가 실사진의 고양이 위치와 일치, 원시 출력에 cat 0회). cat 전용 필터가
+  동물 탐지를 버리고 있었다.
+- **hailo-camera**: watchcat-cat 전용 `config/yolov8s_nms.json`의 allowed_labels를
+  `['cat','dog','person']`으로 확장 (`af23616`, 골프는 yolov8s_nms_golf.json이라 무영향).
+- **게이트웨이**: cat|dog → `catPresent`(개 없는 집이므로 dog=오월이),
+  person → 별도 `personPresent`/`personBoxes` (사진 위 파란 점선 박스, DETAIL에
+  PERSON 행). 배포 후 놓쳤던 실사진 재추론으로 dog×7·person×7 통과 확인. (`a9bc71a`)
+
+### 레이더 움직임 이력
+
+- **움직임 이벤트 기록** — 게이트웨이가 관측 흐름을 서버측 최근접 매칭으로
+  "움직임 에피소드"로 잘라 기록: 250mm 이상 실이동만 점으로 채택(정지 반사체의
+  지터가 몇 시간짜리 이벤트로 늘어지지 않게), 3초 소실 또는 8초 정지 시 종료,
+  경로 600mm 미만은 폐기. 이벤트당 시각·지속·경로 폴리라인·이동거리·최고속도.
+- **보관기간 제한** — 일자별 JSONL(`uploads/watchcat/radar-events/`)로 저장,
+  기본 7일 지나면 자동 삭제 (`WATCHCAT_RADAR_EVENT_RETENTION_DAYS`). 메모리에는
+  최근 200건, 재시작 시 디스크에서 복원.
+- **웹 표시** — `GET /api/v1/radar/events`, 레이더 페이지 하단 "최근 움직임" 목록
+  (부채꼴 미니 썸네일 + 한 줄 요약, 탭하면 본 지도에 6초 유령 궤적 재생),
+  허브 레이더 카드에 "오늘 움직임 N건". 테스트 6건 추가.
+
 ## 2026-08-21 (오후·밤) — 레이더 Phase R1
 
 ### 게이트웨이 + 웹

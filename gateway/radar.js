@@ -2,8 +2,23 @@
 // the radar's never share globals (docs/ld2454-cat-tracker-design.md §2). The
 // gateway is the radar's clock: the node reports uptime sequence numbers, not
 // wall time, so receivedAt here is the authoritative observation time.
+const fsp = require('fs').promises;
+const path = require('path');
+
 const WINDOW_MS = Number(process.env.WATCHCAT_RADAR_WINDOW_MS || 30_000);
 const ONLINE_MS = Number(process.env.WATCHCAT_RADAR_ONLINE_MS || 3_000);
+// Movement events: the 30 s ring answers "what is moving now"; these answer
+// "what moved while nobody watched". A point is recorded only after real travel
+// (EVENT_STEP_MM), so the jitter of a parked reflector — the radar holds a
+// sitting person for minutes — never stretches an episode for hours: a target
+// that stops moving (idle) or vanishes (lost) closes its episode.
+const EVENT_STEP_MM = Number(process.env.WATCHCAT_RADAR_EVENT_STEP_MM || 250);
+const EVENT_IDLE_MS = Number(process.env.WATCHCAT_RADAR_EVENT_IDLE_MS || 8_000);
+const EVENT_LOST_MS = Number(process.env.WATCHCAT_RADAR_EVENT_LOST_MS || 3_000);
+const EVENT_MIN_PATH_MM = Number(process.env.WATCHCAT_RADAR_EVENT_MIN_PATH_MM || 600);
+const EVENT_MAX_POINTS = 120;
+const EVENT_MEMORY = 200;
+const EVENT_RETENTION_DAYS = Math.max(1, Number(process.env.WATCHCAT_RADAR_EVENT_RETENTION_DAYS || 7));
 // One batch is a handful of targets; anything bigger than this is not a radar node.
 const MAX_BODY_BYTES = 4096;
 const MAX_TARGETS = 3;
@@ -11,10 +26,100 @@ const MAX_TARGETS = 3;
 const MAX_OBSERVATIONS = 1200;
 const SENSORS = (process.env.WATCHCAT_RADAR_SENSORS || '').split(',').map(id => id.trim()).filter(Boolean);
 
-module.exports = function createRadar({ authorized }) {
+module.exports = function createRadar({ authorized, eventDir }) {
+  eventDir = eventDir || path.join(process.cwd(), 'radar-events');
   let observations = [];
+  let events = [];  // closed movement episodes, oldest first, capped at EVENT_MEMORY
+  let tracks = [];  // open nearest-neighbour tracks feeding events
+  let cleanupStamp = '';
 
   const json = (res, status, body) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body)); };
+
+  const eventFile = ts => path.join(eventDir, 'events-' + new Date(ts).toISOString().slice(0, 10) + '.jsonl');
+
+  // Restart survival: reload the freshest day files into memory. Two days always
+  // cover EVENT_MEMORY at realistic event rates.
+  (async () => {
+    try {
+      await fsp.mkdir(eventDir, { recursive: true });
+      await cleanupEvents();
+      const names = (await fsp.readdir(eventDir)).filter(name => /^events-\d{4}-\d{2}-\d{2}\.jsonl$/.test(name)).sort().slice(-2);
+      const loaded = [];
+      for (const name of names) for (const line of (await fsp.readFile(path.join(eventDir, name), 'utf8')).split('\n')) {
+        if (!line) continue;
+        try { loaded.push(JSON.parse(line)); } catch {}
+      }
+      events = loaded.concat(events).slice(-EVENT_MEMORY);
+    } catch (error) { console.error('radar event reload failed:', error.message); }
+  })();
+
+  // Files are named by day, so one is deletable only when its whole day sits
+  // past the retention cutoff.
+  async function cleanupEvents() {
+    const cutoff = Date.now() - EVENT_RETENTION_DAYS * 86_400_000;
+    for (const name of await fsp.readdir(eventDir).catch(() => [])) {
+      const day = /^events-(\d{4}-\d{2}-\d{2})\.jsonl$/.exec(name);
+      if (day && Date.parse(day[1]) + 86_400_000 < cutoff) await fsp.unlink(path.join(eventDir, name)).catch(() => {});
+    }
+  }
+
+  async function appendEvent(event) {
+    try {
+      await fsp.mkdir(eventDir, { recursive: true });
+      await fsp.appendFile(eventFile(Date.now()), JSON.stringify(event) + '\n');
+      const stamp = new Date().toISOString().slice(0, 10);
+      if (stamp !== cleanupStamp) { cleanupStamp = stamp; await cleanupEvents(); }
+    } catch (error) { console.error('radar event write failed:', error.message); }
+  }
+
+  // Server-side twin of the map page's nearest-neighbour blobs, cut into
+  // movement episodes for the history feed.
+  function updateTracks(targets, now) {
+    for (const track of tracks) track.matched = false;
+    for (const target of targets) {
+      let best = null, bestDistance = 600;
+      for (const track of tracks) {
+        if (track.matched) continue;
+        const distance = Math.hypot(target.xMm - track.x, target.yMm - track.y);
+        if (distance < bestDistance) { bestDistance = distance; best = track; }
+      }
+      if (!best) {
+        tracks.push({ x: target.xMm, y: target.yMm, matched: true, startAt: now, lastSeen: now, lastMoveAt: now, pathMm: 0, maxSpeed: Math.abs(target.speedMmPerSec), points: [[0, target.xMm, target.yMm]] });
+        continue;
+      }
+      best.matched = true;
+      best.lastSeen = now;
+      best.maxSpeed = Math.max(best.maxSpeed, Math.abs(target.speedMmPerSec));
+      const tail = best.points[best.points.length - 1];
+      const step = Math.hypot(target.xMm - tail[1], target.yMm - tail[2]);
+      if (step >= EVENT_STEP_MM && best.points.length < EVENT_MAX_POINTS) {
+        best.points.push([now - best.startAt, target.xMm, target.yMm]);
+        best.pathMm += step;
+        best.lastMoveAt = now;
+      }
+      best.x = target.xMm;
+      best.y = target.yMm;
+    }
+    for (let i = tracks.length - 1; i >= 0; i--) {
+      const track = tracks[i];
+      if (now - track.lastSeen > EVENT_LOST_MS || now - track.lastMoveAt > EVENT_IDLE_MS) { tracks.splice(i, 1); closeTrack(track); }
+    }
+  }
+
+  function closeTrack(track) {
+    if (track.pathMm < EVENT_MIN_PATH_MM || track.points.length < 3) return;
+    const event = {
+      startAt: new Date(track.startAt).toISOString(),
+      endAt: new Date(track.lastMoveAt).toISOString(),
+      durationMs: track.lastMoveAt - track.startAt,
+      pathMm: Math.round(track.pathMm),
+      maxSpeedMmPerSec: track.maxSpeed,
+      points: track.points,
+    };
+    events.push(event);
+    if (events.length > EVENT_MEMORY) events.shift();
+    appendEvent(event);
+  }
 
   async function readBody(req) {
     const chunks = []; let size = 0;
@@ -58,12 +163,16 @@ module.exports = function createRadar({ authorized }) {
     const now = Date.now();
     observations.push({ receivedAt: now, sensorId, sequence, targets, radarOk });
     prune(now);
+    updateTracks(targets, now);
     return json(res, 202, { ok: true, accepted: true });
   }
 
   function reportStatus(req, res) {
     const now = Date.now();
     prune(now);
+    // A dead node stops delivering batches, so the close sweep would never run;
+    // the page's status polling doubles as its clock.
+    updateTracks([], now);
     const latest = observations[observations.length - 1];
     return json(res, 200, {
       ok: true,
@@ -74,15 +183,30 @@ module.exports = function createRadar({ authorized }) {
       lastSequence: latest ? latest.sequence : null,
       targets: latest ? latest.targets : [],
       observationsInWindow: observations.length,
+      eventsToday: countEventsToday(now),
     });
+  }
+
+  function countEventsToday(now) {
+    const dayStart = new Date(now);
+    dayStart.setHours(0, 0, 0, 0);
+    return events.filter(event => Date.parse(event.startAt) >= dayStart.getTime()).length;
+  }
+
+  function reportEvents(req, res, url) {
+    const limit = Math.min(Math.max(Number(url.searchParams.get('limit')) || 50, 1), EVENT_MEMORY);
+    return json(res, 200, { ok: true, retentionDays: EVENT_RETENTION_DAYS, events: events.slice(-limit).reverse() });
   }
 
   // Sector view: the sensor sits at the wedge's apex, +Y points away from it,
   // ±60° matches the LD2454's azimuth. Trails live client-side (10 s fade) since
   // the status endpoint only serves the latest batch.
-  const page = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>watchcat radar</title><style>body{margin:0;background:#0b0e13;color:#dde;font:14px system-ui}main{max-width:640px;margin:auto;padding:1rem}h2{margin:.2rem 0 .6rem}h2 a{color:#5a6a85;text-decoration:none;font-size:.72rem;float:right;margin-top:.35rem}canvas{width:100%;background:#10141c;border-radius:12px;margin-top:.6rem}#s{color:#8ab;margin:.2rem 0}.on{color:#5ee87f}.off{color:#f66}.warn{color:#e8b45e}button{background:#1c2330;color:#dde;border:1px solid #334;border-radius:8px;padding:.3rem .9rem;margin-right:.4rem}button.sel{background:#2c4a66}</style><main><h2>📡 WATCHCAT RADAR <a href="https://watchcat.linkus-plz.com/">홈</a></h2><p id=s>연결 중…</p><div id=z><button data-r=2000>2m</button><button data-r=4000 class=sel>4m</button><button data-r=8000>8m</button></div><canvas id=c width=640 height=560></canvas></main><script>
+  const page = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>watchcat radar</title><style>body{margin:0;background:#0b0e13;color:#dde;font:14px system-ui}main{max-width:640px;margin:auto;padding:1rem}h2{margin:.2rem 0 .6rem}h2 a{color:#5a6a85;text-decoration:none;font-size:.72rem;float:right;margin-top:.35rem}canvas{width:100%;background:#10141c;border-radius:12px;margin-top:.6rem}#s{color:#8ab;margin:.2rem 0}.on{color:#5ee87f}.off{color:#f66}.warn{color:#e8b45e}button{background:#1c2330;color:#dde;border:1px solid #334;border-radius:8px;padding:.3rem .9rem;margin-right:.4rem}button.sel{background:#2c4a66}
+h3{margin:1.1rem 0 .3rem;font-size:.95rem;color:#9ab8dd}h3 span{color:#5a6a85;font-weight:400;font-size:.75rem}
+.row{display:flex;gap:.7rem;align-items:center;padding:.35rem .2rem;border-bottom:1px solid #1a2233;cursor:pointer;font-size:.82rem;color:#bcd}.row:active{background:#141a26}</style><main><h2>📡 WATCHCAT RADAR <a href="https://watchcat.linkus-plz.com/">홈</a></h2><p id=s>연결 중…</p><div id=z><button data-r=2000>2m</button><button data-r=4000 class=sel>4m</button><button data-r=8000>8m</button></div><canvas id=c width=640 height=560></canvas><h3>최근 움직임 <span id=evn></span></h3><div id=ev></div></main><script>
 const cv=document.getElementById('c'),g=cv.getContext('2d'),st=document.getElementById('s');
 let maxR=4000;const trails=[];const colors=['#5ee87f','#5ec8e8','#e8d45e'];
+let ghost=null,evData=[],retDays=7;
 document.querySelectorAll('#z button').forEach(b=>b.onclick=()=>{maxR=Number(b.dataset.r);document.querySelectorAll('#z button').forEach(x=>x.classList.toggle('sel',x===b))});
 // Size proxy: the radar reports a point, but a bigger body wanders more around
 // its own path (the reflection centre migrates over the torso). Track each
@@ -114,6 +238,7 @@ function draw(targets,online){
  g.strokeStyle='#233049';g.beginPath();g.moveTo(cx,cy);g.lineTo(cx,cy-maxR*sc);g.stroke();
  const now=Date.now();
  for(const p of trails){const age=(now-p.t)/10000;if(age>1)continue;g.fillStyle='rgba(94,232,127,'+(0.45*(1-age)).toFixed(3)+')';g.beginPath();g.arc(cx+p.x*sc,cy-p.y*sc,3,0,7);g.fill()}
+ if(ghost){if(now>ghost.until)ghost=null;else{g.strokeStyle='#e8d45e';g.lineWidth=2;g.beginPath();ghost.points.forEach((p,i)=>{i?g.lineTo(cx+p[1]*sc,cy-p[2]*sc):g.moveTo(cx+p[1]*sc,cy-p[2]*sc)});g.stroke();g.lineWidth=1;const gz=ghost.points[ghost.points.length-1];g.fillStyle='#e8d45e';g.beginPath();g.arc(cx+gz[1]*sc,cy-gz[2]*sc,5,0,7);g.fill()}}
  blobs.forEach((b,i)=>{const px=cx+b.x*sc,py=cy-b.y*sc,sp=spreadOf(b.hist),rr=Math.max(sp*sc,10);
   g.fillStyle='rgba(94,232,127,0.14)';g.strokeStyle='rgba(94,232,127,0.4)';g.beginPath();g.arc(px,py,rr,0,7);g.fill();g.stroke();
   g.fillStyle=colors[i%3];g.beginPath();g.arc(px,py,7,0,7);g.fill();
@@ -131,6 +256,21 @@ async function tick(){clearTimeout(timer);let q=null;
  st.innerHTML=q?((q.sensorOnline?(q.radarOk?'<span class=on>레이더 온라인</span>':'<span class=warn>노드 온라인 · 레이더 무신호</span>'):'<span class=off>레이더 오프라인</span>')+' · 타겟 '+((q.targets||[]).length)+' · '+(q.lastObservedAt?new Date(q.lastObservedAt).toLocaleTimeString():'-')):'게이트웨이 연결 실패';
  draw(targets,Boolean(q&&q.sensorOnline));
  timer=setTimeout(tick,500)}
+// Movement history: each row is one recorded episode; the thumbnail keeps the
+// sector shape so a path reads in the same frame as the live map, and tapping a
+// row replays the path on the map as a 6-second ghost.
+const ev=document.getElementById('ev');
+function thumb(e){const W=84,H=60,tx=W/2,ty=H-5;let reach=4000;for(const p of e.points)if(p[2]>reach)reach=p[2];const ts=(H-10)/reach;
+ let pts='';for(const p of e.points)pts+=(tx+p[1]*ts).toFixed(1)+','+(ty-p[2]*ts).toFixed(1)+' ';
+ const r=(reach*ts).toFixed(1),x0=(tx+reach*ts*Math.cos(-Math.PI/2-Math.PI/3)).toFixed(1),y0=(ty+reach*ts*Math.sin(-Math.PI/2-Math.PI/3)).toFixed(1),x1=(tx+reach*ts*Math.cos(-Math.PI/2+Math.PI/3)).toFixed(1),y1=(ty+reach*ts*Math.sin(-Math.PI/2+Math.PI/3)).toFixed(1);
+ const z=e.points[e.points.length-1];
+ return '<svg width='+W+' height='+H+'><path d="M'+tx+' '+ty+' L'+x0+' '+y0+' A'+r+' '+r+' 0 0 1 '+x1+' '+y1+' Z" fill="#141a26" stroke="#2a3550"/><polyline points="'+pts+'" fill="none" stroke="#e8d45e" stroke-width="1.5"/><circle cx="'+(tx+z[1]*ts).toFixed(1)+'" cy="'+(ty-z[2]*ts).toFixed(1)+'" r="2.5" fill="#e8d45e"/></svg>'}
+function evLine(e){const dur=Math.max(1,Math.round(e.durationMs/1000));return new Date(e.startAt).toLocaleTimeString()+' · '+dur+'초 · '+(e.pathMm/1000).toFixed(1)+'m 이동 · 최고 '+Math.round(e.maxSpeedMmPerSec/10)+'cm/s'}
+function renderEvents(){document.getElementById('evn').textContent=evData.length?evData.length+'건 · 보관 '+retDays+'일':'보관 '+retDays+'일';
+ ev.innerHTML=evData.length?evData.map((e,i)=>'<div class=row data-i='+i+'>'+thumb(e)+'<div>'+evLine(e)+'</div></div>').join(''):'<p style="color:#5a6a85">기록된 움직임이 없습니다</p>';
+ ev.querySelectorAll('.row').forEach(row=>row.onclick=()=>{const e=evData[Number(row.dataset.i)];ghost={points:e.points,until:Date.now()+6000}})}
+async function loadEvents(){try{const q=await fetch('/api/v1/radar/events?limit=30').then(r=>r.json());evData=q.events||[];retDays=q.retentionDays||7;renderEvents()}catch(e){}}
+setInterval(loadEvents,10000);loadEvents();
 tick();
 </script>`;
 
@@ -139,6 +279,7 @@ tick();
     handle(req, res, url) {
       if (req.method === 'POST' && url.pathname === '/api/v1/radar/observations') return acceptObservations(req, res);
       if (req.method === 'GET' && url.pathname === '/api/v1/radar/status') return reportStatus(req, res);
+      if (req.method === 'GET' && url.pathname === '/api/v1/radar/events') return reportEvents(req, res, url);
       return json(res, 404, { ok: false, error: 'Not found' });
     },
   };
