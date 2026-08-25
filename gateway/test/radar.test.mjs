@@ -111,6 +111,13 @@ try {
   check('out-of-range window returns nothing', outside.events.length === 0);
   const inverted = await fetch(`${BASE}/api/v1/radar/events?from=2020-01-02T00:00:00Z&to=2020-01-01T00:00:00Z`);
   check('inverted range is rejected', inverted.status === 400);
+
+  // Hour histogram: the recorded episode lands in its wall-clock bucket.
+  const hourly = await fetch(`${BASE}/api/v1/radar/events/hours?from=${encodeURIComponent(dayStart.toISOString())}`).then(r => r.json());
+  const bucket = Math.floor((Date.parse(episode.startAt) - dayStart.getTime()) / 3_600_000);
+  check('hour histogram counts the episode', Array.isArray(hourly.hours) && hourly.hours[bucket] === 1, JSON.stringify(hourly.hours));
+  check('other hours stay empty', hourly.hours.reduce((sum, n) => sum + n, 0) === 1);
+  check('histogram without from is rejected', (await fetch(`${BASE}/api/v1/radar/events/hours`)).status === 400);
 } finally {
   server.kill();
   await rm(uploadDir, { recursive: true, force: true });

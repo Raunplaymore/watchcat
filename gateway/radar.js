@@ -223,13 +223,36 @@ module.exports = function createRadar({ authorized, eventDir }) {
     return json(res, 200, { ok: true, retentionDays: EVENT_RETENTION_DAYS, ranged: true, events: matched.slice(-500).reverse() });
   }
 
+  // Per-hour counts for one day, bucketed from the client-supplied day start so
+  // the server never guesses the viewer's timezone. Feeds the hour chips.
+  async function reportEventHours(req, res, url) {
+    const from = Date.parse(url.searchParams.get('from') || '');
+    if (!Number.isFinite(from)) return json(res, 400, { ok: false, error: 'from is required' });
+    const hi = from + 86_400_000;
+    const hours = new Array(24).fill(0);
+    for (let day = from - 86_400_000; day <= hi + 86_400_000; day += 86_400_000) {
+      const text = await fsp.readFile(eventFile(day), 'utf8').catch(() => '');
+      for (const line of text.split('\n')) {
+        if (!line) continue;
+        try {
+          const at = Date.parse(JSON.parse(line).startAt);
+          if (at >= from && at < hi) hours[Math.floor((at - from) / 3_600_000)]++;
+        } catch {}
+      }
+    }
+    return json(res, 200, { ok: true, hours });
+  }
+
   // Sector view: the sensor sits at the wedge's apex, +Y points away from it,
   // ±60° matches the LD2454's azimuth. Trails live client-side (10 s fade) since
   // the status endpoint only serves the latest batch.
   const page = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>watchcat radar</title><style>body{margin:0;background:#0b0e13;color:#dde;font:14px system-ui}main{max-width:640px;margin:auto;padding:1rem}h2{margin:.2rem 0 .6rem}h2 a{color:#5a6a85;text-decoration:none;font-size:.72rem;float:right;margin-top:.35rem}canvas{width:100%;background:#10141c;border-radius:12px;margin-top:.6rem}#s{color:#8ab;margin:.2rem 0}.on{color:#5ee87f}.off{color:#f66}.warn{color:#e8b45e}button{background:#1c2330;color:#dde;border:1px solid #334;border-radius:8px;padding:.3rem .9rem;margin-right:.4rem}button.sel{background:#2c4a66}
 h3{margin:1.1rem 0 .3rem;font-size:.95rem;color:#9ab8dd}h3 span{color:#5a6a85;font-weight:400;font-size:.75rem}
 .row{display:flex;gap:.7rem;align-items:center;padding:.35rem .2rem;border-bottom:1px solid #1a2233;cursor:pointer;font-size:.82rem;color:#bcd}.row:active{background:#141a26}
-#fl{display:flex;gap:.35rem;align-items:center;flex-wrap:wrap;margin:.2rem 0 .4rem}#fl input{background:#1c2330;color:#dde;border:1px solid #334;border-radius:8px;padding:.25rem .4rem;font:inherit;color-scheme:dark}#fl button{margin:0;padding:.25rem .7rem}</style><main><h2>📡 WATCHCAT RADAR <a href="https://watchcat.linkus-plz.com/">홈</a></h2><p id=s>연결 중…</p><div id=z><button data-r=2000>2m</button><button data-r=4000 class=sel>4m</button><button data-r=8000>8m</button></div><canvas id=c width=640 height=560></canvas><h3>최근 움직임 <span id=evn></span></h3><div id=fl><input type=date id=fd><input type=time id=f0 value="09:00"><span>~</span><input type=time id=f1 value="18:00"><button id=fb>조회</button><button id=fx style="display:none">지우기</button></div><div id=ev></div></main><script>
+#fl{display:flex;gap:.35rem;align-items:center;flex-wrap:wrap;margin:.2rem 0 .4rem}#fl input{background:#1c2330;color:#dde;border:1px solid #334;border-radius:8px;padding:.25rem .4rem;font:inherit;color-scheme:dark}
+#fh{display:flex;flex-wrap:wrap;gap:.15rem;align-items:center}
+.hc{background:#1c2330;border:1px solid #334;color:#dde;border-radius:6px;padding:.2rem .35rem;margin:0;font-size:.72rem}.hc span{color:#5ee87f;margin-left:.15rem}.hc.sel{background:#2c4a66}
+.hd{color:#31405c;padding:.2rem .15rem;font-size:.72rem}</style><main><h2>📡 WATCHCAT RADAR <a href="https://watchcat.linkus-plz.com/">홈</a></h2><p id=s>연결 중…</p><div id=z><button data-r=2000>2m</button><button data-r=4000 class=sel>4m</button><button data-r=8000>8m</button></div><canvas id=c width=640 height=560></canvas><h3>최근 움직임 <span id=evn></span></h3><div id=fl><input type=date id=fd><div id=fh></div></div><div id=ev></div></main><script>
 const cv=document.getElementById('c'),g=cv.getContext('2d'),st=document.getElementById('s');
 let maxR=4000;const trails=[];const colors=['#5ee87f','#5ec8e8','#e8d45e'];
 let ghost=null,evData=[],retDays=7;
@@ -292,19 +315,26 @@ function thumb(e){const W=84,H=60,tx=W/2,ty=H-5;let reach=4000;for(const p of e.
  const z=e.points[e.points.length-1];
  return '<svg width='+W+' height='+H+'><path d="M'+tx+' '+ty+' L'+x0+' '+y0+' A'+r+' '+r+' 0 0 1 '+x1+' '+y1+' Z" fill="#141a26" stroke="#2a3550"/><polyline points="'+pts+'" fill="none" stroke="#e8d45e" stroke-width="1.5"/><circle cx="'+(tx+z[1]*ts).toFixed(1)+'" cy="'+(ty-z[2]*ts).toFixed(1)+'" r="2.5" fill="#e8d45e"/></svg>'}
 function evLine(e){const dur=Math.max(1,Math.round(e.durationMs/1000));return new Date(e.startAt).toLocaleTimeString()+' · '+dur+'초 · '+(e.pathMm/1000).toFixed(1)+'m 이동 · 최고 '+Math.round(e.maxSpeedMmPerSec/10)+'cm/s'}
-function renderEvents(){document.getElementById('evn').textContent=(filter?'조회 '+evData.length+'건':(evData.length?evData.length+'건':''))+' · 보관 '+retDays+'일';
+function renderEvents(){document.getElementById('evn').textContent=(filter?filter.label+' · '+evData.length+'건':(evData.length?'최근 '+evData.length+'건':''))+' · 보관 '+retDays+'일';
  ev.innerHTML=evData.length?evData.map((e,i)=>'<div class=row data-i='+i+'>'+thumb(e)+'<div>'+evLine(e)+'</div></div>').join(''):'<p style="color:#5a6a85">'+(filter?'이 시간대엔 기록된 움직임이 없습니다':'기록된 움직임이 없습니다')+'</p>';
  ev.querySelectorAll('.row').forEach(row=>row.onclick=()=>{const e=evData[Number(row.dataset.i)];ghost={points:e.points,until:Date.now()+6000}})}
-// Time-range filter: pick a day and a start~end window (e.g. the hours everyone
-// is at work) and the list swaps from the live feed to that slice of history.
+// Hour chips: pick a day and the row shows one chip per hour with its episode
+// count — the empty hours stay dim, so paging skips straight to where something
+// moved. Tapping a chip swaps the list to that hour; 최근 returns to the live 10.
 let filter=null;
-const fd=document.getElementById('fd'),f0=document.getElementById('f0'),f1=document.getElementById('f1'),fb=document.getElementById('fb'),fx=document.getElementById('fx');
+const fd=document.getElementById('fd'),fh=document.getElementById('fh');
 const two=n=>String(n).padStart(2,'0');const today=new Date();fd.value=today.getFullYear()+'-'+two(today.getMonth()+1)+'-'+two(today.getDate());
-fb.onclick=()=>{if(!fd.value)return;const from=new Date(fd.value+'T'+(f0.value||'00:00')),to=new Date(fd.value+'T'+(f1.value||'23:59')+':59');if(to<from)return;filter={from,to};fx.style.display='';loadEvents()};
-fx.onclick=()=>{filter=null;fx.style.display='none';loadEvents()};
-async function loadEvents(){try{const path=filter?'/api/v1/radar/events?from='+encodeURIComponent(filter.from.toISOString())+'&to='+encodeURIComponent(filter.to.toISOString()):'/api/v1/radar/events?limit=30';
+function dayStart(){return new Date(fd.value+'T00:00')}
+async function loadHours(){if(!fd.value){fh.innerHTML='';return}
+ try{const q=await fetch('/api/v1/radar/events/hours?from='+encodeURIComponent(dayStart().toISOString())).then(r=>r.json());
+  fh.innerHTML='<button class="hc'+(filter?'':' sel')+'" id=hall>최근</button>'+(q.hours||[]).map((n,h)=>n?'<button class="hc'+(filter&&filter.h===h?' sel':'')+'" data-h='+h+'>'+two(h)+'<span>'+n+'</span></button>':'<span class=hd>'+two(h)+'</span>').join('');
+  document.getElementById('hall').onclick=()=>{filter=null;loadHours();loadEvents()};
+  fh.querySelectorAll('[data-h]').forEach(b=>b.onclick=()=>{const h=Number(b.dataset.h),from=new Date(dayStart().getTime()+h*3600000);
+   filter={h,from,to:new Date(from.getTime()+3599999),label:fd.value.slice(5).replace('-','/')+' '+two(h)+'시'};loadHours();loadEvents()})}catch(e){}}
+fd.onchange=()=>{filter=null;loadHours();loadEvents()};
+async function loadEvents(){try{const path=filter?'/api/v1/radar/events?from='+encodeURIComponent(filter.from.toISOString())+'&to='+encodeURIComponent(filter.to.toISOString()):'/api/v1/radar/events?limit=10';
  const q=await fetch(path).then(r=>r.json());evData=q.events||[];retDays=q.retentionDays||7;renderEvents()}catch(e){}}
-setInterval(()=>{if(!filter)loadEvents()},10000);loadEvents();
+setInterval(()=>{if(!filter){loadEvents();loadHours()}},10000);loadHours();loadEvents();
 tick();
 </script>`;
 
@@ -314,6 +344,7 @@ tick();
       if (req.method === 'POST' && url.pathname === '/api/v1/radar/observations') return acceptObservations(req, res);
       if (req.method === 'GET' && url.pathname === '/api/v1/radar/status') return reportStatus(req, res);
       if (req.method === 'GET' && url.pathname === '/api/v1/radar/events') return reportEvents(req, res, url);
+      if (req.method === 'GET' && url.pathname === '/api/v1/radar/events/hours') return reportEventHours(req, res, url);
       return json(res, 404, { ok: false, error: 'Not found' });
     },
   };
