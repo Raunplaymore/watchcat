@@ -12,7 +12,7 @@ const MAX_FRAME_BYTES = Number(process.env.WATCHCAT_MAX_FRAME_BYTES || 2 * 1024 
 let inferenceTail = Promise.resolve();
 // latestFilename/capturedAt describe the last inferred still. Live-stream frames
 // are tracked separately so a live frame never gets served next to a stale verdict.
-let state = { cameraOnline: false, inferenceState: 'idle', catPresent: false, confidence: null, catBoxes: [], capturedAt: null, processedAt: null, lastCatAt: null, lastError: null, latestFilename: null, requestId: null, liveFilename: null, liveAt: null };
+let state = { cameraOnline: false, inferenceState: 'idle', catPresent: false, confidence: null, catBoxes: [], personPresent: false, personBoxes: [], capturedAt: null, processedAt: null, lastCatAt: null, lastError: null, latestFilename: null, requestId: null, liveFilename: null, liveAt: null };
 let captureCommand = null;
 let streamCommand = null;
 let streamActive = false;
@@ -41,7 +41,7 @@ async function post(url, value, headers) {
   return result;
 }
 function queue(job) {
-  state = { ...state, cameraOnline: true, inferenceState: 'waiting', catPresent: false, confidence: null, catBoxes: [], lastError: null, latestFilename: job.filename, capturedAt: job.capturedAt, requestId: job.id };
+  state = { ...state, cameraOnline: true, inferenceState: 'waiting', catPresent: false, confidence: null, catBoxes: [], personPresent: false, personBoxes: [], lastError: null, latestFilename: job.filename, capturedAt: job.capturedAt, requestId: job.id };
   const run = inferenceTail.then(() => infer(job), () => infer(job)); inferenceTail = run.catch(() => {});
 }
 async function infer(job) {
@@ -50,16 +50,20 @@ async function infer(job) {
     await post(`${HAILO_URL}/api/meta/from-file`, { jobId: job.id, inputPath: job.file, filename: job.filename, model: 'watchcat-cat', width: job.width, height: job.height, force: true }, hailoHeaders());
     const response = await fetch(`${HAILO_URL}/api/session/${encodeURIComponent(job.id)}/meta?model=watchcat-cat`, { headers: HAILO_TOKEN ? { Authorization: `Bearer ${HAILO_TOKEN}` } : {} });
     const meta = await response.json().catch(() => ({})); if (!response.ok) throw new Error(meta.error || `Metadata HTTP ${response.status}`);
-    const cats = (meta.frames || []).flatMap(frame => frame.detections || []).filter(item => item.label === 'cat');
+    const detections = (meta.frames || []).flatMap(frame => frame.detections || []);
+    // No dog lives here, so a 'dog' verdict is in practice the cat — the COCO
+    // model reads the white cat's back-turned posture as dog and misses 'cat'.
+    const cats = detections.filter(item => item.label === 'cat' || item.label === 'dog');
+    const persons = detections.filter(item => item.label === 'person');
     const confidence = cats.reduce((best, item) => Math.max(best, Number(item.conf) || 0), 0);
     // Boxes ride along normalized [x, y, w, h] so the monitor can paint them over
     // the photo. Rounded to 3 decimals — the monitor parses this JSON by hand and
     // full doubles would only bloat what it has to scan.
     // Hailo runs the same still through several frames, so identical detections
     // repeat; dedupe or one cat shows up as four stacked boxes.
-    const catBoxes = [...new Set(cats.map(item => Array.isArray(item.bbox) && item.bbox.length === 4 ? JSON.stringify(item.bbox.map(value => Math.round(Number(value) * 1000) / 1000)) : null).filter(Boolean))].slice(0, 4).map(JSON.parse);
-    state = { ...state, inferenceState: 'complete', catPresent: cats.length > 0, confidence: cats.length ? confidence : null, catBoxes, processedAt: new Date().toISOString(), lastCatAt: cats.length ? new Date().toISOString() : state.lastCatAt, lastError: null };
-  } catch (error) { state = { ...state, inferenceState: 'error', catPresent: false, confidence: null, catBoxes: [], processedAt: new Date().toISOString(), lastError: error.message }; }
+    const boxesOf = items => [...new Set(items.map(item => Array.isArray(item.bbox) && item.bbox.length === 4 ? JSON.stringify(item.bbox.map(value => Math.round(Number(value) * 1000) / 1000)) : null).filter(Boolean))].slice(0, 4).map(JSON.parse);
+    state = { ...state, inferenceState: 'complete', catPresent: cats.length > 0, confidence: cats.length ? confidence : null, catBoxes: boxesOf(cats), personPresent: persons.length > 0, personBoxes: boxesOf(persons), processedAt: new Date().toISOString(), lastCatAt: cats.length ? new Date().toISOString() : state.lastCatAt, lastError: null };
+  } catch (error) { state = { ...state, inferenceState: 'error', catPresent: false, confidence: null, catBoxes: [], personPresent: false, personBoxes: [], processedAt: new Date().toISOString(), lastError: error.message }; }
 }
 // MJPEG fan-out: one long-lived multipart response per viewer, each new live
 // frame pushed the moment the sensor uploads it. A viewer whose socket has
@@ -171,7 +175,7 @@ h1{margin:.2rem 0 .8rem;letter-spacing:.06em;font-size:1.1rem;color:#9ab8dd}h1 a
 #body{flex:1;min-height:0;overflow:hidden}
 #big{font-size:1.5rem;margin:1.2rem 0 .8rem;font-weight:700}#msg{color:#bcd;font-size:.8rem;line-height:1.5;word-break:break-all}
 table{border-collapse:collapse;font-size:.78rem}td{padding:.18rem .6rem .18rem 0}td:first-child{color:#5ec8e8}
-.ph{position:relative;margin-top:.2rem}.ph img{width:100%;display:block;border-radius:4px;background:#0d1118}.bx{position:absolute;border:2px solid #5ee87f}
+.ph{position:relative;margin-top:.2rem}.ph img{width:100%;display:block;border-radius:4px;background:#0d1118}.bx{position:absolute;border:2px solid #5ee87f}.bxp{position:absolute;border:2px dashed #5ec8e8}
 #cap{color:#bcd;font-size:.72rem;margin-top:.4rem}
 #nav{margin-top:auto;padding-top:.5rem;font-size:.8rem;color:#fff}#act{font-size:.8rem;color:#fff}
 #pads{display:flex;justify-content:center;gap:1.6rem;margin:1.1rem 0}
@@ -196,9 +200,10 @@ function actionOf(){return['CAPTURE','RELOAD',S.livePaused?'RESUME':'PAUSE','REF
 function chrome(){$('nav').textContent='< '+pages[S.page]+' >';$('act').textContent='B2: '+actionOf()}
 function renderStatus(){const[t,c,m]=verdict(S.q);$('body').innerHTML='<div id=big></div><div id=msg></div>';$('big').textContent=t;$('big').style.color=c;$('dv').style.borderColor=c;$('msg').textContent=m;chrome()}
 function renderPhoto(){const q=S.q||{};let bx='';(q.catBoxes||[]).forEach(b=>{bx+='<div class=bx style="left:'+(b[0]*100)+'%;top:'+(b[1]*100)+'%;width:'+(b[2]*100)+'%;height:'+(b[3]*100)+'%"></div>'});
+ (q.personBoxes||[]).forEach(b=>{bx+='<div class=bxp style="left:'+(b[0]*100)+'%;top:'+(b[1]*100)+'%;width:'+(b[2]*100)+'%;height:'+(b[3]*100)+'%"></div>'});
  $('body').innerHTML='<div class=ph><img src="/api/v1/latest.jpg?t='+Date.now()+'">'+bx+'</div><div id=cap>'+verdict(q)[0]+(q.processedAt?' · '+new Date(q.processedAt).toLocaleTimeString():'')+'</div>';$('dv').style.borderColor='#e8d45e';chrome()}
 function renderLive(){const src=S.livePaused?'/api/v1/live.jpg?t='+Date.now():'/api/v1/live.mjpeg';$('body').innerHTML='<div class=ph><img id=lv src="'+src+'"></div><div id=cap>'+(S.livePaused?'일시정지':'live (mjpeg)')+'</div>';$('dv').style.borderColor='#e8d45e';chrome()}
-function renderDetail(){const q=S.q||{};const rows=[['CONF',String(q.confidence||'-').slice(0,5)],['STATE',q.inferenceState||'-'],['CAT',q.catPresent?'yes':'no'],['SHOT',q.capturedAt||'-'],['DONE',q.processedAt?String(q.processedAt).slice(11,19):'-'],['FILE',q.latestFilename||'-'],['ERR',q.lastError||'-']];
+function renderDetail(){const q=S.q||{};const rows=[['CONF',String(q.confidence||'-').slice(0,5)],['STATE',q.inferenceState||'-'],['CAT',q.catPresent?'yes':'no'],['PERSON',q.personPresent?'yes':'no'],['SHOT',q.capturedAt||'-'],['DONE',q.processedAt?String(q.processedAt).slice(11,19):'-'],['FILE',q.latestFilename||'-'],['ERR',q.lastError||'-']];
  $('body').innerHTML='<table>'+rows.map(r=>'<tr><td>'+r[0]+'</td><td>'+String(r[1]).replace(/</g,'&lt;')+'</td></tr>').join('')+'</table>';$('dv').style.borderColor='#5ec8e8';chrome()}
 function render(){[renderStatus,renderPhoto,renderLive,renderDetail][S.page]()}
 async function setStream(active){try{await api('/api/v1/stream',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({active:active})})}catch(e){}}
