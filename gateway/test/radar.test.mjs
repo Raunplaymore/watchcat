@@ -102,6 +102,15 @@ try {
   await new Promise(r => setTimeout(r, 100));
   const dayFiles = await readdir(path.join(uploadDir, 'radar-events')).catch(() => []);
   check('episode persisted to a day file', dayFiles.length === 1, dayFiles.join(','));
+
+  // Time-range queries read the day files, not the memory ring.
+  const dayStart = new Date(); dayStart.setHours(0, 0, 0, 0);
+  const ranged = await fetch(`${BASE}/api/v1/radar/events?from=${encodeURIComponent(dayStart.toISOString())}&to=${encodeURIComponent(new Date().toISOString())}`).then(r => r.json());
+  check('ranged query reads the day file', ranged.ranged === true && ranged.events.length === 1, String(ranged.events.length));
+  const outside = await fetch(`${BASE}/api/v1/radar/events?from=2000-01-01T00:00:00Z&to=2000-01-02T00:00:00Z`).then(r => r.json());
+  check('out-of-range window returns nothing', outside.events.length === 0);
+  const inverted = await fetch(`${BASE}/api/v1/radar/events?from=2020-01-02T00:00:00Z&to=2020-01-01T00:00:00Z`);
+  check('inverted range is rejected', inverted.status === 400);
 } finally {
   server.kill();
   await rm(uploadDir, { recursive: true, force: true });
